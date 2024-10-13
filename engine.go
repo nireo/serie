@@ -120,73 +120,6 @@ func (t *TSMTree) createTSMFile() (*TSMFile, error) {
 	}, nil
 }
 
-func (f *TSMFile) write(key string, points []Point) error {
-	// Ignore empty points
-	if len(points) == 0 {
-		return nil
-	}
-
-	sort.Slice(points, func(i, j int) bool {
-		return points[i].Timestamp < points[j].Timestamp
-	})
-	offset := f.writePos
-
-	if err := f.writeKey(key); err != nil {
-		return err
-	}
-
-	if err := binary.Write(f.file, binary.LittleEndian, uint32(len(points))); err != nil {
-		return err
-	}
-
-	timestamps := make([]int64, len(points))
-	for i, p := range points {
-		timestamps[i] = p.Timestamp
-	}
-	if err := f.writeTimestamps(timestamps); err != nil {
-		return err
-	}
-
-	values := make([]float64, len(points))
-	for i, p := range points {
-		values[i] = p.Value
-	}
-	if err := f.writeValues(values); err != nil {
-		return err
-	}
-
-	blockSize := f.writePos - offset
-
-	f.index[key] = append(f.index[key], IndexEntry{
-		MinTime: points[0].Timestamp,
-		MaxTime: points[len(points)-1].Timestamp,
-		Offset:  offset,
-		Size:    blockSize,
-	})
-	err := binary.Write(f.file, binary.LittleEndian, uint16(len(key)))
-	if err != nil {
-		return err
-	}
-
-	_, err = f.file.WriteString(key)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (f *TSMFile) writeKey(key string) error {
-	if err := binary.Write(f.file, binary.LittleEndian, uint16(len(key))); err != nil {
-		return err
-	}
-	if _, err := f.file.WriteString(key); err != nil {
-		return err
-	}
-	f.writePos += 2 + int64(len(key))
-	return nil
-}
-
 func (f *TSMFile) writeTimestamps(timestamps []int64) error {
 	if len(timestamps) == 0 {
 		return nil
@@ -217,13 +150,107 @@ func (f *TSMFile) writeValues(values []float64) error {
 	return nil
 }
 
+func (f *TSMFile) finalize() error {
+	indexOffset := f.writePos
+
+	if err := binary.Write(f.file, binary.LittleEndian, uint32(len(f.index))); err != nil {
+		return err
+	}
+
+	for key, entries := range f.index {
+		if err := f.writeKey(key); err != nil {
+			return err
+		}
+
+		if err := binary.Write(f.file, binary.LittleEndian, uint32(len(entries))); err != nil {
+			return err
+		}
+
+		for _, entry := range entries {
+			if err := binary.Write(f.file, binary.LittleEndian, entry); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := binary.Write(f.file, binary.LittleEndian, indexOffset); err != nil {
+		return err
+	}
+
+	return f.file.Sync()
+}
+
+func (f *TSMFile) write(key string, points []Point) error {
+	// Ignore empty points
+	if len(points) == 0 {
+		return nil
+	}
+
+	sort.Slice(points, func(i, j int) bool {
+		return points[i].Timestamp < points[j].Timestamp
+	})
+	offset := f.writePos
+
+	if err := f.writeKey(key); err != nil {
+		return err
+	}
+
+	if err := binary.Write(f.file, binary.LittleEndian, uint32(len(points))); err != nil {
+		return err
+	}
+
+	f.writePos += 4 // Update writePos for the uint32 write
+
+	timestamps := make([]int64, len(points))
+	for i, p := range points {
+		timestamps[i] = p.Timestamp
+	}
+	if err := f.writeTimestamps(timestamps); err != nil {
+		return err
+	}
+
+	values := make([]float64, len(points))
+	for i, p := range points {
+		values[i] = p.Value
+	}
+	if err := f.writeValues(values); err != nil {
+		return err
+	}
+
+	blockSize := f.writePos - offset
+
+	f.index[key] = append(f.index[key], IndexEntry{
+		MinTime: points[0].Timestamp,
+		MaxTime: points[len(points)-1].Timestamp,
+		Offset:  offset,
+		Size:    blockSize,
+	})
+
+	return nil
+}
+
+func (f *TSMFile) writeKey(key string) error {
+	keyLength := uint16(len(key))
+	if err := binary.Write(f.file, binary.LittleEndian, keyLength); err != nil {
+		return err
+	}
+	f.writePos += 2 // Update writePos for the uint16 write
+
+	n, err := f.file.WriteString(key)
+	if err != nil {
+		return err
+	}
+	f.writePos += int64(n) // Update writePos for the string write
+
+	return nil
+}
+
 func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
 	entries, ok := f.index[key]
 	if !ok {
 		return nil, nil
 	}
 
-	// TODO: prealloc to this to reduce allocations
 	var results []Point
 	for _, entry := range entries {
 		if entry.MinTime > maxTime || entry.MaxTime < minTime {
@@ -238,8 +265,17 @@ func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
 		if err := binary.Read(f.file, binary.LittleEndian, &keyLength); err != nil {
 			return nil, err
 		}
-		if _, err := f.file.Seek(int64(keyLength), io.SeekCurrent); err != nil {
+		keyBuffer := make([]byte, keyLength)
+		n, err := f.file.Read(keyBuffer)
+		if err != nil {
 			return nil, err
+		}
+		if n != int(keyLength) {
+			return nil, fmt.Errorf("expected to read %d bytes for key, but read %d", keyLength, n)
+		}
+		readKey := string(keyBuffer)
+		if readKey != key {
+			return nil, fmt.Errorf("key mismatch: expected %s, got %s", key, readKey)
 		}
 
 		var numPoints uint32
@@ -276,34 +312,4 @@ func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
 	})
 
 	return results, nil
-}
-
-func (f *TSMFile) finalize() error {
-	indexOffset := f.writePos
-
-	if err := binary.Write(f.file, binary.LittleEndian, uint32(len(f.index))); err != nil {
-		return err
-	}
-
-	for key, entries := range f.index {
-		if err := f.writeKey(key); err != nil {
-			return err
-		}
-
-		if err := binary.Write(f.file, binary.LittleEndian, uint32(len(entries))); err != nil {
-			return err
-		}
-
-		for _, entry := range entries {
-			if err := binary.Write(f.file, binary.LittleEndian, entry); err != nil {
-				return err
-			}
-		}
-	}
-
-	if err := binary.Write(f.file, binary.LittleEndian, indexOffset); err != nil {
-		return err
-	}
-
-	return f.file.Sync()
 }

@@ -97,11 +97,51 @@ func (t *TSMTree) Read(key string, minTime, maxTime int64) ([]Point, error) {
 		}
 	}
 
+	// Not found in memory, read from disk
+	for _, file := range t.files {
+		fileRes, err := file.read(key, minTime, maxTime)
+		if err != nil {
+			return nil, err
+		}
+
+		res = append(res, fileRes...)
+	}
+
 	sort.Slice(res, func(i, j int) bool {
 		return res[i].Timestamp < res[j].Timestamp
 	})
 
 	return res, nil
+}
+
+func (t *TSMTree) Flush() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if len(t.immutable) == 0 {
+		return nil
+	}
+
+	file, err := t.createTSMFile()
+	if err != nil {
+		return err
+	}
+
+	for _, table := range t.immutable {
+		for key, points := range table.data {
+			if err := file.write(key, points); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := file.finalize(); err != nil {
+		return err
+	}
+
+	t.files = append(t.files, file)
+	t.immutable = nil // reset the array
+	return nil
 }
 
 func (t *TSMTree) createTSMFile() (*TSMFile, error) {

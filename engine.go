@@ -1,6 +1,7 @@
 package serie
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -9,7 +10,14 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/golang/snappy"
 )
+
+type Engine interface {
+	Write(key string, timestamp int64, val float64) error
+	Read(key string, minTime, maxTime int64) error
+}
 
 type Point struct {
 	Metric    string
@@ -192,7 +200,6 @@ func (f *TSMFile) writeValues(values []float64) error {
 
 func (f *TSMFile) finalize() error {
 	indexOffset := f.writePos
-
 	if err := binary.Write(f.file, binary.LittleEndian, uint32(len(f.index))); err != nil {
 		return err
 	}
@@ -220,8 +227,23 @@ func (f *TSMFile) finalize() error {
 	return f.file.Sync()
 }
 
+func (f *TSMFile) writeKey(key string) error {
+	keyLength := uint16(len(key))
+	if err := binary.Write(f.file, binary.LittleEndian, keyLength); err != nil {
+		return err
+	}
+	f.writePos += 2
+
+	n, err := f.file.WriteString(key)
+	if err != nil {
+		return err
+	}
+	f.writePos += int64(n)
+
+	return nil
+}
+
 func (f *TSMFile) write(key string, points []Point) error {
-	// Ignore empty points
 	if len(points) == 0 {
 		return nil
 	}
@@ -229,58 +251,51 @@ func (f *TSMFile) write(key string, points []Point) error {
 	sort.Slice(points, func(i, j int) bool {
 		return points[i].Timestamp < points[j].Timestamp
 	})
+
 	offset := f.writePos
 
+	// Write key
 	if err := f.writeKey(key); err != nil {
 		return err
 	}
 
-	if err := binary.Write(f.file, binary.LittleEndian, uint32(len(points))); err != nil {
+	// Prepare data for compression
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.LittleEndian, uint32(len(points))); err != nil {
 		return err
 	}
 
-	f.writePos += 4 // Update writePos for the uint32 write
-
-	timestamps := make([]int64, len(points))
-	for i, p := range points {
-		timestamps[i] = p.Timestamp
+	for _, p := range points {
+		if err := binary.Write(&buf, binary.LittleEndian, p.Timestamp); err != nil {
+			return err
+		}
+		if err := binary.Write(&buf, binary.LittleEndian, p.Value); err != nil {
+			return err
+		}
 	}
-	if err := f.writeTimestamps(timestamps); err != nil {
+
+	// Compress and write data
+	compressedData := snappy.Encode(nil, buf.Bytes())
+
+	// Write the size of the compressed data first
+	if err := binary.Write(f.file, binary.LittleEndian, uint32(len(compressedData))); err != nil {
 		return err
 	}
+	f.writePos += 4
 
-	values := make([]float64, len(points))
-	for i, p := range points {
-		values[i] = p.Value
-	}
-	if err := f.writeValues(values); err != nil {
+	n, err := f.file.Write(compressedData)
+	if err != nil {
 		return err
 	}
+	f.writePos += int64(n)
 
 	blockSize := f.writePos - offset
-
 	f.index[key] = append(f.index[key], IndexEntry{
 		MinTime: points[0].Timestamp,
 		MaxTime: points[len(points)-1].Timestamp,
 		Offset:  offset,
 		Size:    blockSize,
 	})
-
-	return nil
-}
-
-func (f *TSMFile) writeKey(key string) error {
-	keyLength := uint16(len(key))
-	if err := binary.Write(f.file, binary.LittleEndian, keyLength); err != nil {
-		return err
-	}
-	f.writePos += 2 // Update writePos for the uint16 write
-
-	n, err := f.file.WriteString(key)
-	if err != nil {
-		return err
-	}
-	f.writePos += int64(n) // Update writePos for the string write
 
 	return nil
 }
@@ -301,48 +316,53 @@ func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
 			return nil, err
 		}
 
-		var keyLength uint16
-		if err := binary.Read(f.file, binary.LittleEndian, &keyLength); err != nil {
+		var klen uint16
+		if err := binary.Read(f.file, binary.LittleEndian, &klen); err != nil {
+			return nil, fmt.Errorf("failed to read key length: %v", err)
+		}
+
+		keyBytes := make([]byte, klen)
+		if _, err := io.ReadFull(f.file, keyBytes); err != nil {
+			return nil, fmt.Errorf("failed to read key: %v", err)
+		}
+
+		// Read the size of the compressed data
+		var compressedSize uint32
+		if err := binary.Read(f.file, binary.LittleEndian, &compressedSize); err != nil {
 			return nil, err
 		}
-		keyBuffer := make([]byte, keyLength)
-		n, err := f.file.Read(keyBuffer)
+
+		compressedData := make([]byte, compressedSize)
+		_, err := io.ReadFull(f.file, compressedData)
 		if err != nil {
 			return nil, err
 		}
-		if n != int(keyLength) {
-			return nil, fmt.Errorf("expected to read %d bytes for key, but read %d", keyLength, n)
+
+		decompressedData, err := snappy.Decode(nil, compressedData)
+		if err != nil {
+			return nil, err
 		}
-		readKey := string(keyBuffer)
-		if readKey != key {
-			return nil, fmt.Errorf("key mismatch: expected %s, got %s", key, readKey)
-		}
+
+		buf := bytes.NewReader(decompressedData)
 
 		var numPoints uint32
-		if err := binary.Read(f.file, binary.LittleEndian, &numPoints); err != nil {
+		if err := binary.Read(buf, binary.LittleEndian, &numPoints); err != nil {
 			return nil, err
 		}
 
-		timestamps := make([]int64, numPoints)
-		if err := binary.Read(f.file, binary.LittleEndian, &timestamps[0]); err != nil {
-			return nil, err
-		}
-		for i := uint32(1); i < numPoints; i++ {
-			var delta int64
-			if err := binary.Read(f.file, binary.LittleEndian, &delta); err != nil {
+		for i := uint32(0); i < numPoints; i++ {
+			var timestamp int64
+			var value float64
+
+			if err := binary.Read(buf, binary.LittleEndian, &timestamp); err != nil {
 				return nil, err
 			}
-			timestamps[i] = timestamps[i-1] + delta
-		}
+			if err := binary.Read(buf, binary.LittleEndian, &value); err != nil {
+				return nil, err
+			}
 
-		values := make([]float64, numPoints)
-		if err := binary.Read(f.file, binary.LittleEndian, &values); err != nil {
-			return nil, err
-		}
-
-		for i, ts := range timestamps {
-			if ts >= minTime && ts <= maxTime {
-				results = append(results, Point{Timestamp: ts, Value: values[i]})
+			if timestamp >= minTime && timestamp <= maxTime {
+				results = append(results, Point{Timestamp: timestamp, Value: value})
 			}
 		}
 	}

@@ -1,9 +1,13 @@
 package serie
 
 import (
+	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -55,9 +59,64 @@ func (s *HttpService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *HttpService) write(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "unrecognized method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "error reading request body", http.StatusBadRequest)
+		return
+	}
+
+	var points []Point
+	err = json.Unmarshal(body, &points)
+	if err != nil {
+		http.Error(w, "error parsing json", http.StatusBadRequest)
+		return
+	}
+
+	err = s.db.WriteBatch(points)
+	if err != nil {
+		http.Error(w, "error writing data points", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *HttpService) read(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "unrecognized method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	qr := r.URL.Query()
+	metric := qr.Get("metric")
+	tsStart := qr.Get("start")
+	tsEnd := qr.Get("end")
+
+	tsStartInt, err := strconv.ParseInt(tsStart, 10, 64)
+	if err != nil {
+		http.Error(w, "timestamp start was not a number", http.StatusBadRequest)
+		return
+	}
+
+	tsEndInt, err := strconv.ParseInt(tsEnd, 10, 64)
+	if err != nil {
+		http.Error(w, "timestamp end was not a number", http.StatusBadRequest)
+		return
+	}
+
+	points, err := s.db.Read(metric, tsStartInt, tsEndInt)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error reading data points: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(points)
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *HttpService) Close() error {

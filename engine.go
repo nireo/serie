@@ -111,11 +111,12 @@ func (t *TSMTree) createTSMFile() (*TSMFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
 	return &TSMFile{
-		path:  path,
-		index: make(map[string][]IndexEntry),
+		path:     path,
+		index:    make(map[string][]IndexEntry),
+		writePos: 0,
+		file:     file,
 	}, nil
 }
 
@@ -134,7 +135,7 @@ func (f *TSMFile) write(key string, points []Point) error {
 		return err
 	}
 
-	if err := binary.Write(f.file, binary.BigEndian, uint32(len(points))); err != nil {
+	if err := binary.Write(f.file, binary.LittleEndian, uint32(len(points))); err != nil {
 		return err
 	}
 
@@ -176,7 +177,7 @@ func (f *TSMFile) write(key string, points []Point) error {
 }
 
 func (f *TSMFile) writeKey(key string) error {
-	if err := binary.Write(f.file, binary.BigEndian, uint16(len(key))); err != nil {
+	if err := binary.Write(f.file, binary.LittleEndian, uint16(len(key))); err != nil {
 		return err
 	}
 	if _, err := f.file.WriteString(key); err != nil {
@@ -191,13 +192,13 @@ func (f *TSMFile) writeTimestamps(timestamps []int64) error {
 		return nil
 	}
 
-	if err := binary.Write(f.file, binary.BigEndian, timestamps[0]); err != nil {
+	if err := binary.Write(f.file, binary.LittleEndian, timestamps[0]); err != nil {
 		return err
 	}
 
 	for i := 1; i < len(timestamps); i++ {
 		delta := timestamps[i] - timestamps[i-1]
-		if err := binary.Write(f.file, binary.BigEndian, delta); err != nil {
+		if err := binary.Write(f.file, binary.LittleEndian, delta); err != nil {
 			return err
 		}
 	}
@@ -208,7 +209,7 @@ func (f *TSMFile) writeTimestamps(timestamps []int64) error {
 
 func (f *TSMFile) writeValues(values []float64) error {
 	for _, v := range values {
-		if err := binary.Write(f.file, binary.BigEndian, v); err != nil {
+		if err := binary.Write(f.file, binary.LittleEndian, v); err != nil {
 			return err
 		}
 	}
@@ -234,7 +235,7 @@ func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
 		}
 
 		var keyLength uint16
-		if err := binary.Read(f.file, binary.BigEndian, &keyLength); err != nil {
+		if err := binary.Read(f.file, binary.LittleEndian, &keyLength); err != nil {
 			return nil, err
 		}
 		if _, err := f.file.Seek(int64(keyLength), io.SeekCurrent); err != nil {
@@ -242,24 +243,24 @@ func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
 		}
 
 		var numPoints uint32
-		if err := binary.Read(f.file, binary.BigEndian, &numPoints); err != nil {
+		if err := binary.Read(f.file, binary.LittleEndian, &numPoints); err != nil {
 			return nil, err
 		}
 
 		timestamps := make([]int64, numPoints)
-		if err := binary.Read(f.file, binary.BigEndian, &timestamps[0]); err != nil {
+		if err := binary.Read(f.file, binary.LittleEndian, &timestamps[0]); err != nil {
 			return nil, err
 		}
 		for i := uint32(1); i < numPoints; i++ {
 			var delta int64
-			if err := binary.Read(f.file, binary.BigEndian, &delta); err != nil {
+			if err := binary.Read(f.file, binary.LittleEndian, &delta); err != nil {
 				return nil, err
 			}
 			timestamps[i] = timestamps[i-1] + delta
 		}
 
 		values := make([]float64, numPoints)
-		if err := binary.Read(f.file, binary.BigEndian, &values); err != nil {
+		if err := binary.Read(f.file, binary.LittleEndian, &values); err != nil {
 			return nil, err
 		}
 
@@ -280,7 +281,7 @@ func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
 func (f *TSMFile) finalize() error {
 	indexOffset := f.writePos
 
-	if err := binary.Write(f.file, binary.BigEndian, uint32(len(f.index))); err != nil {
+	if err := binary.Write(f.file, binary.LittleEndian, uint32(len(f.index))); err != nil {
 		return err
 	}
 
@@ -289,18 +290,18 @@ func (f *TSMFile) finalize() error {
 			return err
 		}
 
-		if err := binary.Write(f.file, binary.BigEndian, uint32(len(entries))); err != nil {
+		if err := binary.Write(f.file, binary.LittleEndian, uint32(len(entries))); err != nil {
 			return err
 		}
 
 		for _, entry := range entries {
-			if err := binary.Write(f.file, binary.BigEndian, entry); err != nil {
+			if err := binary.Write(f.file, binary.LittleEndian, entry); err != nil {
 				return err
 			}
 		}
 	}
 
-	if err := binary.Write(f.file, binary.BigEndian, indexOffset); err != nil {
+	if err := binary.Write(f.file, binary.LittleEndian, indexOffset); err != nil {
 		return err
 	}
 

@@ -1,6 +1,8 @@
 package serie
 
 import (
+	"io"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -124,5 +126,135 @@ func TestTSMTreeConcurrency(t *testing.T) {
 
 	if len(results) != totalWrites {
 		t.Errorf("Expected %d total writes, got %d", totalWrites, len(results))
+	}
+}
+
+func TestTSMFileWriteRead(t *testing.T) {
+	tmpfile, err := os.CreateTemp("", "tsm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	tsmFile := &TSMFile{
+		file:     tmpfile,
+		index:    make(map[string][]IndexEntry),
+		writePos: 0,
+	}
+
+	key := "cpu.usage"
+	points := []Point{
+		{Timestamp: 1000, Value: 10.0},
+		{Timestamp: 2000, Value: 20.0},
+		{Timestamp: 3000, Value: 30.0},
+		{Timestamp: 4000, Value: 40.0},
+		{Timestamp: 5000, Value: 50.0},
+	}
+
+	err = tsmFile.write(key, points)
+	if err != nil {
+		t.Fatalf("Failed to write data: %v", err)
+	}
+
+	err = tsmFile.finalize()
+	if err != nil {
+		t.Fatalf("Failed to finalize file: %v", err)
+	}
+
+	_, err = tsmFile.file.Seek(0, io.SeekStart)
+	if err != nil {
+		t.Fatalf("Failed to seek to beginning of file: %v", err)
+	}
+
+	readPoints, err := tsmFile.read(key, 0, 6000)
+	if err != nil {
+		t.Fatalf("Failed to read data: %v", err)
+	}
+
+	if len(readPoints) != len(points) {
+		t.Fatalf("Expected %d points, got %d", len(points), len(readPoints))
+	}
+	for i, p := range points {
+		if p.Timestamp != readPoints[i].Timestamp || p.Value != readPoints[i].Value {
+			t.Errorf("Point mismatch at index %d. Expected %v, got %v", i, p, readPoints[i])
+		}
+	}
+
+	readPoints, err = tsmFile.read(key, 2500, 4500)
+	if err != nil {
+		t.Fatalf("Failed to read subset of data: %v", err)
+	}
+	if len(readPoints) != 2 {
+		t.Fatalf("Expected 2 points in subset, got %d", len(readPoints))
+	}
+	if readPoints[0].Timestamp != 3000 || readPoints[1].Timestamp != 4000 {
+		t.Errorf("Unexpected timestamps in subset. Got %v and %v", readPoints[0].Timestamp, readPoints[1].Timestamp)
+	}
+
+	readPoints, err = tsmFile.read("non.existent.key", 0, 6000)
+	if err != nil {
+		t.Fatalf("Failed to read non-existent key: %v", err)
+	}
+	if len(readPoints) != 0 {
+		t.Errorf("Expected 0 points for non-existent key, got %d", len(readPoints))
+	}
+}
+
+func TestTSMFileWriteReadMultipleKeys(t *testing.T) {
+	tmpfile, err := os.CreateTemp("", "tsm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	tsmFile := &TSMFile{
+		file:     tmpfile,
+		index:    make(map[string][]IndexEntry),
+		writePos: 0,
+	}
+
+	data := map[string][]Point{
+		"cpu.usage": {
+			{Timestamp: 1000, Value: 10.0},
+			{Timestamp: 2000, Value: 20.0},
+		},
+		"mem.usage": {
+			{Timestamp: 1500, Value: 15.0},
+			{Timestamp: 2500, Value: 25.0},
+		},
+	}
+
+	for key, points := range data {
+		err = tsmFile.write(key, points)
+		if err != nil {
+			t.Fatalf("Failed to write data for key %s: %v", key, err)
+		}
+	}
+
+	err = tsmFile.finalize()
+	if err != nil {
+		t.Fatalf("Failed to finalize file: %v", err)
+	}
+
+	_, err = tsmFile.file.Seek(0, io.SeekStart)
+	if err != nil {
+		t.Fatalf("Failed to seek to beginning of file: %v", err)
+	}
+
+	for key, expectedPoints := range data {
+		readPoints, err := tsmFile.read(key, 0, 3000)
+		if err != nil {
+			t.Fatalf("Failed to read data for key %s: %v", key, err)
+		}
+
+		if len(readPoints) != len(expectedPoints) {
+			t.Fatalf("For key %s: expected %d points, got %d", key, len(expectedPoints), len(readPoints))
+		}
+
+		for i, p := range expectedPoints {
+			if p.Timestamp != readPoints[i].Timestamp || p.Value != readPoints[i].Value {
+				t.Errorf("For key %s: point mismatch at index %d. Expected %v, got %v", key, i, p, readPoints[i])
+			}
+		}
 	}
 }

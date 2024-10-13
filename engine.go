@@ -1,6 +1,7 @@
 package serie
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -88,6 +89,10 @@ func (t *TSMTree) Read(key string, minTime, maxTime int64) ([]Point, error) {
 			}
 		}
 	}
+
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].Timestamp < res[j].Timestamp
+	})
 
 	return res, nil
 }

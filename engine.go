@@ -103,6 +103,53 @@ func (t *TSMTree) Read(key string, minTime, maxTime int64) ([]Point, error) {
 	defer t.mu.RUnlock()
 
 	var res []Point
+	res = append(res, t.readFromMem(key, minTime, maxTime)...)
+
+	// Read the points from disk in a parallel fashion.
+	var wg sync.WaitGroup
+	resultsChan := make(chan []Point, len(t.files))
+	errorChan := make(chan error, len(t.files))
+
+	for _, file := range t.files {
+		wg.Add(1)
+
+		go func(f *TSMFile) {
+			defer wg.Done()
+			points, err := f.read(key, minTime, maxTime)
+			if err != nil {
+				errorChan <- err
+				return
+			}
+			resultsChan <- points
+		}(file)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+		close(errorChan)
+	}()
+
+	for err := range errorChan {
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for points := range resultsChan {
+		res = append(res, points...)
+	}
+
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].Timestamp < res[j].Timestamp
+	})
+
+	return res, nil
+}
+
+func (t *TSMTree) readFromMem(key string, minTime, maxTime int64) []Point {
+	var res []Point
+
 	if points, ok := t.mem.data[key]; ok {
 		for _, p := range points {
 			if p.Timestamp >= minTime && p.Timestamp <= maxTime {
@@ -111,7 +158,6 @@ func (t *TSMTree) Read(key string, minTime, maxTime int64) ([]Point, error) {
 		}
 	}
 
-	// TODO: Concurrency here
 	for _, immutable := range t.immutable {
 		if points, ok := immutable.data[key]; ok {
 			for _, p := range points {
@@ -122,21 +168,7 @@ func (t *TSMTree) Read(key string, minTime, maxTime int64) ([]Point, error) {
 		}
 	}
 
-	// Not found in memory, read from disk
-	for _, file := range t.files {
-		fileRes, err := file.read(key, minTime, maxTime)
-		if err != nil {
-			return nil, err
-		}
-
-		res = append(res, fileRes...)
-	}
-
-	sort.Slice(res, func(i, j int) bool {
-		return res[i].Timestamp < res[j].Timestamp
-	})
-
-	return res, nil
+	return res
 }
 
 func (t *TSMTree) Flush() error {

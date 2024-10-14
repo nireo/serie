@@ -7,6 +7,8 @@ import (
 	"unicode"
 )
 
+// query.go -- this file handles all of the query building code the lexing and parsing and the query construction from that
+
 const (
 	tokSelect = iota
 	tokWhere
@@ -23,7 +25,6 @@ type token struct {
 	kind     int
 }
 
-// query.go -- this file handles all of the query building code the lexing and parsing and the query construction from that
 type lexer struct {
 	idx  int
 	data string

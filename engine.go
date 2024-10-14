@@ -24,6 +24,7 @@ type Point struct {
 	Metric    string  `json:"metric"`
 	Value     float64 `json:"value"`
 	Timestamp int64   `json:"timestamp"`
+	Tags      map[string]string
 }
 
 type TSMTree struct {
@@ -34,6 +35,7 @@ type TSMTree struct {
 	maxMemSize  int
 	mu          sync.RWMutex
 	flushTicker *time.Ticker
+	writeMu     sync.Mutex
 }
 
 type Memtable struct {
@@ -82,19 +84,47 @@ func (t *TSMTree) Write(key string, timestamp int64, val float64) error {
 }
 
 func (t *TSMTree) WriteBatch(points []Point) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 
-	for _, p := range points {
-		t.mem.data[p.Metric] = append(t.mem.data[p.Metric], p)
-		t.mem.size += 16
+	const batchSize = 2048
+	var wg sync.WaitGroup
+	errorChan := make(chan error, (len(points)+batchSize-1)/batchSize)
 
-		if t.mem.size >= t.maxMemSize {
-			t.immutable = append(t.immutable, t.mem)
-			t.mem = &Memtable{data: make(map[string][]Point)}
+	for i := 0; i < len(points); i += batchSize {
+		wg.Add(1)
+		go func(start int) {
+			defer wg.Done()
+			end := start + batchSize
+			if end > len(points) {
+				end = len(points)
+			}
+			if err := t.writeBatch(points[start:end]); err != nil {
+				errorChan <- err
+			}
+		}(i)
+	}
+
+	go func() {
+		wg.Wait()
+		close(errorChan)
+	}()
+
+	for err := range errorChan {
+		if err != nil {
+			return err
 		}
 	}
 
+	return nil
+}
+
+func (t *TSMTree) writeBatch(points []Point) error {
+	for _, p := range points {
+		if err := t.Write(p.Metric, p.Timestamp, p.Value); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -179,16 +209,43 @@ func (t *TSMTree) Flush() error {
 		return nil
 	}
 
+	var wg sync.WaitGroup
+	errorChan := make(chan error, len(t.immutable))
+
+	for _, table := range t.immutable {
+		wg.Add(1)
+		go func(mt *Memtable) {
+			defer wg.Done()
+			if err := t.flushMemtable(mt); err != nil {
+				errorChan <- err
+			}
+		}(table)
+	}
+
+	go func() {
+		wg.Wait()
+		close(errorChan)
+	}()
+
+	for err := range errorChan {
+		if err != nil {
+			return err
+		}
+	}
+
+	t.immutable = nil // reset the array
+	return nil
+}
+
+func (t *TSMTree) flushMemtable(table *Memtable) error {
 	file, err := t.createTSMFile()
 	if err != nil {
 		return err
 	}
 
-	for _, table := range t.immutable {
-		for key, points := range table.data {
-			if err := file.write(key, points); err != nil {
-				return err
-			}
+	for key, points := range table.data {
+		if err := file.write(key, points); err != nil {
+			return err
 		}
 	}
 
@@ -197,7 +254,6 @@ func (t *TSMTree) Flush() error {
 	}
 
 	t.files = append(t.files, file)
-	t.immutable = nil // reset the array
 	return nil
 }
 
@@ -215,36 +271,6 @@ func (t *TSMTree) createTSMFile() (*TSMFile, error) {
 		writePos: 0,
 		file:     file,
 	}, nil
-}
-
-func (f *TSMFile) writeTimestamps(timestamps []int64) error {
-	if len(timestamps) == 0 {
-		return nil
-	}
-
-	if err := binary.Write(f.file, binary.LittleEndian, timestamps[0]); err != nil {
-		return err
-	}
-
-	for i := 1; i < len(timestamps); i++ {
-		delta := timestamps[i] - timestamps[i-1]
-		if err := binary.Write(f.file, binary.LittleEndian, delta); err != nil {
-			return err
-		}
-	}
-
-	f.writePos += int64(len(timestamps) * 8)
-	return nil
-}
-
-func (f *TSMFile) writeValues(values []float64) error {
-	for _, v := range values {
-		if err := binary.Write(f.file, binary.LittleEndian, v); err != nil {
-			return err
-		}
-	}
-	f.writePos += int64(len(values) * 8)
-	return nil
 }
 
 func (f *TSMFile) finalize() error {
@@ -315,11 +341,35 @@ func (f *TSMFile) write(key string, points []Point) error {
 	}
 
 	for _, p := range points {
+		// write basic stuff
 		if err := binary.Write(&buf, binary.LittleEndian, p.Timestamp); err != nil {
 			return err
 		}
+
 		if err := binary.Write(&buf, binary.LittleEndian, p.Value); err != nil {
 			return err
+		}
+
+		if err := binary.Write(&buf, binary.LittleEndian, uint8(len(p.Tags))); err != nil {
+			return err
+		}
+
+		for tag, val := range p.Tags {
+			if err := binary.Write(&buf, binary.LittleEndian, uint8(len(tag))); err != nil {
+				return err
+			}
+
+			if _, err := buf.WriteString(tag); err != nil {
+				return err
+			}
+
+			if err := binary.Write(&buf, binary.LittleEndian, uint8(len(val))); err != nil {
+				return err
+			}
+
+			if _, err := buf.WriteString(val); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -355,7 +405,7 @@ func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
 		return nil, nil
 	}
 
-	var results []Point
+	var res []Point
 	for _, entry := range entries {
 		if entry.MinTime > maxTime || entry.MaxTime < minTime {
 			continue
@@ -375,7 +425,6 @@ func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
 			return nil, fmt.Errorf("failed to read key: %v", err)
 		}
 
-		// Read the size of the compressed data
 		var compressedSize uint32
 		if err := binary.Read(f.file, binary.LittleEndian, &compressedSize); err != nil {
 			return nil, err
@@ -402,23 +451,52 @@ func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
 		for i := uint32(0); i < numPoints; i++ {
 			var timestamp int64
 			var value float64
+			var tagsLen uint8
 
 			if err := binary.Read(buf, binary.LittleEndian, &timestamp); err != nil {
 				return nil, err
 			}
+
 			if err := binary.Read(buf, binary.LittleEndian, &value); err != nil {
 				return nil, err
 			}
 
+			if err := binary.Read(buf, binary.LittleEndian, &tagsLen); err != nil {
+				return nil, err
+			}
+
+			tagMap := make(map[string]string, tagsLen)
+			for tagIdx := uint8(0); tagIdx < tagsLen; tagIdx++ {
+				var tagKeyLen, tagValLen uint8
+				if err := binary.Read(buf, binary.LittleEndian, &tagKeyLen); err != nil {
+					return nil, err
+				}
+
+				tagKey := make([]byte, tagKeyLen)
+				if _, err := io.ReadFull(buf, tagKey); err != nil {
+					return nil, err
+				}
+
+				if err := binary.Read(buf, binary.LittleEndian, &tagValLen); err != nil {
+					return nil, err
+				}
+
+				tagVal := make([]byte, tagValLen)
+				if _, err := io.ReadFull(buf, tagVal); err != nil {
+					return nil, err
+				}
+				tagMap[string(tagKey)] = string(tagVal)
+			}
+
 			if timestamp >= minTime && timestamp <= maxTime {
-				results = append(results, Point{Timestamp: timestamp, Value: value})
+				res = append(res, Point{Timestamp: timestamp, Value: value, Tags: tagMap})
 			}
 		}
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Timestamp < results[j].Timestamp
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].Timestamp < res[j].Timestamp
 	})
 
-	return results, nil
+	return res, nil
 }

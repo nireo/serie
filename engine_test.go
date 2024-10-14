@@ -144,11 +144,31 @@ func TestTSMFileWriteRead(t *testing.T) {
 
 	key := "cpu.usage"
 	points := []Point{
-		{Timestamp: 1000, Value: 10.0},
-		{Timestamp: 2000, Value: 20.0},
-		{Timestamp: 3000, Value: 30.0},
-		{Timestamp: 4000, Value: 40.0},
-		{Timestamp: 5000, Value: 50.0},
+		{Timestamp: 1000, Value: 10.0,
+			Tags: map[string]string{
+				"tag1": "value2",
+			},
+		},
+		{Timestamp: 2000, Value: 20.0,
+			Tags: map[string]string{
+				"tag1": "value3",
+			},
+		},
+		{Timestamp: 3000, Value: 30.0,
+			Tags: map[string]string{
+				"tag1": "value6",
+			},
+		},
+		{Timestamp: 4000, Value: 40.0,
+			Tags: map[string]string{
+				"tag2": "value1",
+			},
+		},
+		{Timestamp: 5000, Value: 50.0,
+			Tags: map[string]string{
+				"tag1": "value3",
+			},
+		},
 	}
 
 	err = tsmFile.write(key, points)
@@ -189,6 +209,10 @@ func TestTSMFileWriteRead(t *testing.T) {
 	}
 	if readPoints[0].Timestamp != 3000 || readPoints[1].Timestamp != 4000 {
 		t.Errorf("Unexpected timestamps in subset. Got %v and %v", readPoints[0].Timestamp, readPoints[1].Timestamp)
+	}
+
+	if readPoints[0].Tags["tag1"] != "value6" || readPoints[1].Tags["tag2"] != "value1" {
+		t.Errorf("Unexpected tag values. Got: %v and %v", readPoints[0].Tags["tag1"], readPoints[0].Tags["tag2"])
 	}
 
 	readPoints, err = tsmFile.read("non.existent.key", 0, 6000)

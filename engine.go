@@ -16,14 +16,14 @@ import (
 
 type Engine interface {
 	Write(key string, timestamp int64, val float64) error
-	Read(key string, minTime, maxTime int64) error
+	Read(key string, minTime, maxTime int64) ([]Point, error)
+	WriteBatch(points []Point) error
 }
 
 type Point struct {
-	Metric    string
-	Tags      map[string]string
-	Value     float64
-	Timestamp int64
+	Metric    string  `json:"metric"`
+	Value     float64 `json:"value"`
+	Timestamp int64   `json:"timestamp"`
 }
 
 type TSMTree struct {
@@ -76,6 +76,23 @@ func (t *TSMTree) Write(key string, timestamp int64, val float64) error {
 	if t.mem.size >= t.maxMemSize {
 		t.immutable = append(t.immutable, t.mem)
 		t.mem = &Memtable{data: make(map[string][]Point)}
+	}
+
+	return nil
+}
+
+func (t *TSMTree) WriteBatch(points []Point) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for _, p := range points {
+		t.mem.data[p.Metric] = append(t.mem.data[p.Metric], p)
+		t.mem.size += 16
+
+		if t.mem.size >= t.maxMemSize {
+			t.immutable = append(t.immutable, t.mem)
+			t.mem = &Memtable{data: make(map[string][]Point)}
+		}
 	}
 
 	return nil

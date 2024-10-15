@@ -3,6 +3,7 @@ package serie
 import (
 	"io"
 	"os"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -280,5 +281,60 @@ func TestTSMFileWriteReadMultipleKeys(t *testing.T) {
 				t.Errorf("For key %s: point mismatch at index %d. Expected %v, got %v", key, i, p, readPoints[i])
 			}
 		}
+	}
+}
+
+func TestTSMFileEncodeDecodeIndex(t *testing.T) {
+	tests := []struct {
+		name  string
+		index map[string][]IndexEntry
+	}{
+		{
+			name:  "Empty index",
+			index: map[string][]IndexEntry{},
+		},
+		{
+			name: "Single metric, single entry",
+			index: map[string][]IndexEntry{
+				"cpu": {
+					{MinTime: 100, MaxTime: 200, Offset: 0, Size: 100},
+				},
+			},
+		},
+		{
+			name: "Multiple metrics, multiple entries",
+			index: map[string][]IndexEntry{
+				"cpu": {
+					{MinTime: 100, MaxTime: 200, Offset: 0, Size: 100},
+					{MinTime: 300, MaxTime: 400, Offset: 100, Size: 150},
+				},
+				"memory": {
+					{MinTime: 150, MaxTime: 250, Offset: 250, Size: 120},
+					{MinTime: 350, MaxTime: 450, Offset: 370, Size: 130},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tsmFile := &TSMFile{index: tt.index}
+
+			encoded, err := tsmFile.encodeIndex()
+			if err != nil {
+				t.Fatalf("Failed to encode index: %v", err)
+			}
+
+			decodedTSMFile := &TSMFile{}
+
+			err = decodedTSMFile.decodeIndex(encoded)
+			if err != nil {
+				t.Fatalf("Failed to decode index: %v", err)
+			}
+
+			if !reflect.DeepEqual(tt.index, decodedTSMFile.index) {
+				t.Errorf("Decoded index does not match original index.\nOriginal: %+v\nDecoded: %+v", tt.index, decodedTSMFile.index)
+			}
+		})
 	}
 }

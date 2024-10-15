@@ -1,7 +1,9 @@
 package serie
 
 import (
+	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"reflect"
 	"sync"
@@ -336,5 +338,69 @@ func TestTSMFileEncodeDecodeIndex(t *testing.T) {
 				t.Errorf("Decoded index does not match original index.\nOriginal: %+v\nDecoded: %+v", tt.index, decodedTSMFile.index)
 			}
 		})
+	}
+}
+
+func generateTestPoints(metric string, minTimestamp int64, maxTimestamp int64, increment int64) []Point {
+	var points []Point
+
+	for ts := minTimestamp; ts <= maxTimestamp; ts += increment {
+		points = append(points, Point{
+			Metric:    metric,
+			Timestamp: ts,
+			Value:     rand.Float64(),
+		})
+	}
+
+	return points
+}
+
+func TestParseDataDir(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "serie-")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// low size to force multiple immutable files
+	tree := NewTSMTree(tempDir, 256)
+
+	err = tree.WriteBatch(generateTestPoints("parse-dir", 1000, 2000, 10))
+	if err != nil {
+		t.Fatalf("failed to write points: %v", err)
+	}
+
+	if err := tree.Flush(); err != nil {
+		t.Fatalf("error flushing tree: %v", err)
+	}
+
+	expectedFileCount := len(tree.files)
+	expectedIndexEntriesForPath := make(map[string][]IndexEntry)
+	for _, f := range tree.files {
+		expectedIndexEntriesForPath[f.path] = f.index["parse-dir"]
+	}
+
+	if err := tree.Close(); err != nil {
+		t.Fatalf("failed to close tsm tree: %v", err)
+	}
+
+	tree2 := NewTSMTree(tempDir, 256)
+	if err := tree2.parseDataDir(); err != nil {
+		t.Fatalf("error parsing data dir: %v", err)
+	}
+
+	if len(tree2.files) != expectedFileCount {
+		t.Fatalf("parsed wrong amount of files, got: %v", len(tree2.files))
+	}
+
+	gotIndexEntriesForPath := make(map[string][]IndexEntry)
+	for _, f := range tree2.files {
+		gotIndexEntriesForPath[f.path] = f.index["parse-dir"]
+	}
+
+	fmt.Println(gotIndexEntriesForPath)
+
+	if !reflect.DeepEqual(gotIndexEntriesForPath, expectedIndexEntriesForPath) {
+		t.Fatalf("parsed file indecies differ\n\tgot: %+v\n\t want: %+v", gotIndexEntriesForPath, expectedFileCount)
 	}
 }

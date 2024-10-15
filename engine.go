@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -254,6 +256,20 @@ func (t *TSMTree) Flush() error {
 	return nil
 }
 
+func (t *TSMTree) Close() error {
+	if err := t.Flush(); err != nil {
+		return err
+	}
+
+	for _, f := range t.files {
+		if err := f.file.Close(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (t *TSMTree) flushMemtable(table *Memtable) error {
 	file, err := t.createTSMFile()
 	if err != nil {
@@ -264,6 +280,10 @@ func (t *TSMTree) flushMemtable(table *Memtable) error {
 		if err := file.write(key, points); err != nil {
 			return err
 		}
+	}
+
+	if err := file.createIndexFile(); err != nil {
+		return err
 	}
 
 	if err := file.finalize(); err != nil {
@@ -633,5 +653,112 @@ func (t *TSMFile) decodeIndex(data []byte) error {
 		t.index[string(metric)] = indexes
 	}
 
+	return nil
+}
+
+func (t *TSMFile) createIndexFile() error {
+	indexPath := t.path[0:len(t.path)-4] + ".idx"
+
+	indexFile, err := os.Create(indexPath)
+	if err != nil {
+		return err
+	}
+	defer indexFile.Close() // we don't need to keep the indexFile open since it won't be written to
+
+	encodedIndex, err := t.encodeIndex()
+	if err != nil {
+		return err
+	}
+
+	// write the snappy compressed data into the file
+	if _, err := indexFile.Write(encodedIndex); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// parseDataDir takes all of the index files in the data dir and then
+// builds in the TSM files from the directory and reads the indicies
+func (t *TSMTree) parseDataDir() error {
+	entries, err := os.ReadDir(t.dataDir)
+	if err != nil {
+		return err
+	}
+
+	var tsmFiles []*TSMFile
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(entries))
+	tsmFileChan := make(chan *TSMFile, 16)
+
+	for _, entry := range entries {
+		if entry.IsDir() { // dirs shouldn't exist but just make sure
+			continue
+		}
+
+		// ignore every file that is not an index.
+		if !strings.HasSuffix(entry.Name(), ".idx") {
+			continue
+		}
+
+		wg.Add(1)
+		go func(entry os.DirEntry) {
+			defer wg.Done()
+			entryName := entry.Name()
+
+			tsmPath := path.Join(t.dataDir, entryName[:len(entryName)-4]+".tsm")
+			tsmFile := &TSMFile{
+				path: tsmPath,
+			}
+			fileData, err := os.ReadFile(path.Join(t.dataDir, entryName))
+			if err != nil {
+				errChan <- fmt.Errorf("error reading file %s: %w", entryName, err)
+				return
+			}
+
+			if err := tsmFile.decodeIndex(fileData); err != nil {
+				errChan <- fmt.Errorf("error decoding index for file %s: %w", entryName, err)
+				return
+			}
+
+			// open the actual tsm file such that we can read from it
+			file, err := os.Open(tsmFile.path)
+			if err != nil {
+				errChan <- fmt.Errorf("error decoding index for file %s: %w", entryName, err)
+				return
+			}
+
+			tsmFile.file = file
+			tsmFileChan <- tsmFile
+		}(entry)
+	}
+
+	go func() {
+		wg.Wait()
+		close(errChan)
+		close(tsmFileChan)
+	}()
+
+	for {
+		select {
+		case err, ok := <-errChan:
+			if !ok {
+				errChan = nil
+			} else if err != nil {
+				return err
+			}
+		case tsmFile, ok := <-tsmFileChan:
+			if !ok {
+				tsmFileChan = nil
+			} else {
+				tsmFiles = append(tsmFiles, tsmFile)
+			}
+		}
+		if errChan == nil && tsmFileChan == nil {
+			break
+		}
+	}
+
+	t.files = tsmFiles
 	return nil
 }

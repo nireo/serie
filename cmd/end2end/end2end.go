@@ -12,17 +12,20 @@ import (
 
 const (
 	numMetrics    = 10
-	numWriters    = 5
-	numReaders    = 3
-	writeDuration = 10 * time.Second
-	readInterval  = 200 * time.Millisecond
-	batchSize     = 100
+	numWriters    = 3
+	numReaders    = 10
+	writeDuration = 30 * time.Second
+	readInterval  = 2 * time.Second
+	batchSize     = 256
 	writeInterval = 100 * time.Millisecond
+	flushInterval = 5 * time.Second
 )
 
 func main() {
 	config := serie.DefaultConfig()
 	config.DataDir = "./data"
+	config.MaxMemSize = 256 * 512
+	config.FlushInterval = flushInterval
 	tree := serie.NewTSMTree(config)
 	defer tree.Close()
 	defer os.RemoveAll(config.DataDir)
@@ -44,7 +47,6 @@ func main() {
 	close(done)
 
 	wg.Wait()
-
 	fmt.Println("Concurrent operations completed.")
 }
 

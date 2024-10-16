@@ -34,6 +34,7 @@ func init() {
 }
 
 func main() {
+	flag.Parse()
 	config := serie.DefaultConfig()
 	config.DataDir = dataDir
 	tree := serie.NewTSMTree(config)

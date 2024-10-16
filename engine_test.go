@@ -217,7 +217,7 @@ func TestTSMFileWriteRead(t *testing.T) {
 		t.Fatalf("Failed to write data: %v", err)
 	}
 
-	err = tsmFile.finalize()
+	err = tsmFile.file.Sync()
 	if err != nil {
 		t.Fatalf("Failed to finalize file: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestTSMFileWriteReadMultipleKeys(t *testing.T) {
 		}
 	}
 
-	err := tsmFile.finalize()
+	err := tsmFile.file.Sync()
 	if err != nil {
 		t.Fatalf("Failed to finalize file: %v", err)
 	}
@@ -417,7 +417,7 @@ func TestParseDataDir(t *testing.T) {
 	}
 
 	if len(tree2.files) != expectedFileCount {
-		t.Fatalf("parsed wrong amount of files, got: %v", len(tree2.files))
+		t.Fatalf("parsed wrong amount of files, got: %v | expected: %v", len(tree2.files), expectedFileCount)
 	}
 
 	gotIndexEntriesForPath := make(map[string][]IndexEntry)

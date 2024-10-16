@@ -61,6 +61,7 @@ type Memtable struct {
 }
 
 type TSMFile struct {
+	mu       sync.RWMutex
 	path     string
 	file     *os.File
 	index    map[string][]IndexEntry
@@ -330,7 +331,7 @@ func (t *TSMTree) flushMemtable(table *Memtable) error {
 	}
 	t.log.Info().Msg("created a tsm index file")
 
-	if err := file.finalize(); err != nil {
+	if err := file.file.Sync(); err != nil {
 		return err
 	}
 	t.log.Info().Msg("finalized tsm index file")
@@ -355,66 +356,19 @@ func (t *TSMTree) createTSMFile() (*TSMFile, error) {
 	}, nil
 }
 
-func (f *TSMFile) finalize() error {
-	indexOffset := f.writePos
-	if err := binary.Write(f.file, binary.LittleEndian, uint32(len(f.index))); err != nil {
-		return err
-	}
-
-	for key, entries := range f.index {
-		if err := f.writeKey(key); err != nil {
-			return err
-		}
-
-		if err := binary.Write(f.file, binary.LittleEndian, uint32(len(entries))); err != nil {
-			return err
-		}
-
-		for _, entry := range entries {
-			if err := binary.Write(f.file, binary.LittleEndian, entry); err != nil {
-				return err
-			}
-		}
-	}
-
-	if err := binary.Write(f.file, binary.LittleEndian, indexOffset); err != nil {
-		return err
-	}
-
-	return f.file.Sync()
-}
-
-func (f *TSMFile) writeKey(key string) error {
-	keyLength := uint16(len(key))
-	if err := binary.Write(f.file, binary.LittleEndian, keyLength); err != nil {
-		return err
-	}
-	f.writePos += 2
-
-	n, err := f.file.WriteString(key)
-	if err != nil {
-		return err
-	}
-	f.writePos += int64(n)
-
-	return nil
-}
-
 func (f *TSMFile) write(key string, points []Point) error {
 	if len(points) == 0 {
 		return nil
 	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	sort.Slice(points, func(i, j int) bool {
 		return points[i].Timestamp < points[j].Timestamp
 	})
 
 	offset := f.writePos
-
-	// Write key
-	if err := f.writeKey(key); err != nil {
-		return err
-	}
 
 	// Prepare data for compression
 	var buf bytes.Buffer
@@ -482,6 +436,9 @@ func (f *TSMFile) write(key string, points []Point) error {
 }
 
 func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
 	entries, ok := f.index[key]
 	if !ok {
 		return nil, nil
@@ -493,36 +450,18 @@ func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
 			continue
 		}
 
-		if _, err := f.file.Seek(entry.Offset, io.SeekStart); err != nil {
-			return nil, err
-		}
-
-		var klen uint16
-		if err := binary.Read(f.file, binary.LittleEndian, &klen); err != nil {
-			return nil, fmt.Errorf("failed to read key length: %v", err)
-		}
-
-		keyBytes := make([]byte, klen)
-		if _, err := io.ReadFull(f.file, keyBytes); err != nil {
-			return nil, fmt.Errorf("failed to read key: %v", err)
-		}
-
-		var compressedSize uint32
-		if err := binary.Read(f.file, binary.LittleEndian, &compressedSize); err != nil {
-			return nil, err
-		}
-
-		compressedData := make([]byte, compressedSize)
-		_, err := io.ReadFull(f.file, compressedData)
+		data := make([]byte, entry.Size)
+		_, err := f.file.ReadAt(data, entry.Offset)
 		if err != nil {
 			return nil, err
 		}
 
+		compressedSize := binary.LittleEndian.Uint32(data[:4])
+		compressedData := data[4 : 4+compressedSize]
 		decompressedData, err := snappy.Decode(nil, compressedData)
 		if err != nil {
 			return nil, err
 		}
-
 		buf := bytes.NewReader(decompressedData)
 
 		var numPoints uint32
@@ -734,7 +673,7 @@ func (t *TSMTree) parseDataDir() error {
 	var tsmFiles []*TSMFile
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(entries))
-	tsmFileChan := make(chan *TSMFile, 16)
+	tsmFileChan := make(chan *TSMFile)
 
 	for _, entry := range entries {
 		if entry.IsDir() { // dirs shouldn't exist but just make sure

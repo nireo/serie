@@ -11,8 +11,50 @@ import (
 	"time"
 )
 
+func createTestTreeInTmpDir(t *testing.T, maxMemSize int) (*TSMTree, func()) {
+	t.Helper()
+	tempDir, err := os.MkdirTemp("", "serie-")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+
+	// low size to force multiple immutable files
+	tree := NewTSMTree(Config{
+		DataDir:       tempDir,
+		MaxMemSize:    maxMemSize,
+		FlushInterval: 1 * time.Minute, // ensure that no flushes happen during this test.
+	})
+
+	return tree, func() {
+		tree.Close()
+		os.RemoveAll(tempDir)
+	}
+}
+
+func createTestTsmFile(t *testing.T) (*TSMFile, func()) {
+	t.Helper()
+
+	tmpfile, err := os.CreateTemp("", "tsm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	tsmFile := &TSMFile{
+		file:     tmpfile,
+		index:    make(map[string][]IndexEntry),
+		writePos: 0,
+	}
+
+	return tsmFile, func() {
+		tsmFile.file.Close()
+		os.Remove(tmpfile.Name())
+	}
+}
+
 func TestTSMTreeWrite(t *testing.T) {
-	tree := NewTSMTree("/tmp/tsmtest", 100)
+	tree, cleanup := createTestTreeInTmpDir(t, 100)
+	defer cleanup()
 
 	err := tree.Write("cpu.usage", 1000, 50.0)
 	if err != nil {
@@ -36,7 +78,9 @@ func TestTSMTreeWrite(t *testing.T) {
 }
 
 func TestTSMTreeRead(t *testing.T) {
-	tree := NewTSMTree("/tmp/tsmtest", 1000)
+	tree, cleanup := createTestTreeInTmpDir(t, 100)
+	defer cleanup()
+
 	testData := []struct {
 		key       string
 		timestamp int64
@@ -70,7 +114,8 @@ func TestTSMTreeRead(t *testing.T) {
 }
 
 func TestTSMTreeReadFromImmutable(t *testing.T) {
-	tree := NewTSMTree("/tmp/tsmtest", 50)
+	tree, cleanup := createTestTreeInTmpDir(t, 50)
+	defer cleanup()
 
 	for i := 0; i < 10; i++ {
 		err := tree.Write("cpu.usage", int64(1000+i*100), float64(50+i))
@@ -99,7 +144,9 @@ func TestTSMTreeReadFromImmutable(t *testing.T) {
 }
 
 func TestTSMTreeConcurrency(t *testing.T) {
-	tree := NewTSMTree("/tmp/tsmtest", 1000)
+	tree, cleanup := createTestTreeInTmpDir(t, 1000)
+	defer cleanup()
+
 	concurrency := 10
 	writesPerGoroutine := 100
 
@@ -133,17 +180,8 @@ func TestTSMTreeConcurrency(t *testing.T) {
 }
 
 func TestTSMFileWriteRead(t *testing.T) {
-	tmpfile, err := os.CreateTemp("", "tsm")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(tmpfile.Name())
-
-	tsmFile := &TSMFile{
-		file:     tmpfile,
-		index:    make(map[string][]IndexEntry),
-		writePos: 0,
-	}
+	tsmFile, cleanup := createTestTsmFile(t)
+	defer cleanup()
 
 	key := "cpu.usage"
 	points := []Point{
@@ -174,7 +212,7 @@ func TestTSMFileWriteRead(t *testing.T) {
 		},
 	}
 
-	err = tsmFile.write(key, points)
+	err := tsmFile.write(key, points)
 	if err != nil {
 		t.Fatalf("Failed to write data: %v", err)
 	}
@@ -228,17 +266,8 @@ func TestTSMFileWriteRead(t *testing.T) {
 }
 
 func TestTSMFileWriteReadMultipleKeys(t *testing.T) {
-	tmpfile, err := os.CreateTemp("", "tsm")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(tmpfile.Name())
-
-	tsmFile := &TSMFile{
-		file:     tmpfile,
-		index:    make(map[string][]IndexEntry),
-		writePos: 0,
-	}
+	tsmFile, cleanup := createTestTsmFile(t)
+	defer cleanup()
 
 	data := map[string][]Point{
 		"cpu.usage": {
@@ -252,13 +281,13 @@ func TestTSMFileWriteReadMultipleKeys(t *testing.T) {
 	}
 
 	for key, points := range data {
-		err = tsmFile.write(key, points)
+		err := tsmFile.write(key, points)
 		if err != nil {
 			t.Fatalf("Failed to write data for key %s: %v", key, err)
 		}
 	}
 
-	err = tsmFile.finalize()
+	err := tsmFile.finalize()
 	if err != nil {
 		t.Fatalf("Failed to finalize file: %v", err)
 	}
@@ -356,16 +385,10 @@ func generateTestPoints(metric string, minTimestamp int64, maxTimestamp int64, i
 }
 
 func TestParseDataDir(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "serie-")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tree, cleanup := createTestTreeInTmpDir(t, 256)
+	defer cleanup()
 
-	// low size to force multiple immutable files
-	tree := NewTSMTree(tempDir, 256)
-
-	err = tree.WriteBatch(generateTestPoints("parse-dir", 1000, 2000, 10))
+	err := tree.WriteBatch(generateTestPoints("parse-dir", 1000, 2000, 10))
 	if err != nil {
 		t.Fatalf("failed to write points: %v", err)
 	}
@@ -384,7 +407,11 @@ func TestParseDataDir(t *testing.T) {
 		t.Fatalf("failed to close tsm tree: %v", err)
 	}
 
-	tree2 := NewTSMTree(tempDir, 256)
+	tree2 := NewTSMTree(Config{
+		DataDir:       tree.dataDir,
+		MaxMemSize:    256,
+		FlushInterval: 1 * time.Minute, // ensure that no flushes happen during this test.
+	})
 	if err := tree2.parseDataDir(); err != nil {
 		t.Fatalf("error parsing data dir: %v", err)
 	}

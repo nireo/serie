@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -50,6 +51,7 @@ type TSMTree struct {
 	mu          sync.RWMutex
 	flushTicker *time.Ticker
 	writeMu     sync.Mutex
+	done        chan struct{}
 }
 
 type Memtable struct {
@@ -76,14 +78,45 @@ type TimeRange struct {
 	End   int64
 }
 
-func NewTSMTree(dataDir string, maxMemSize int) *TSMTree {
-	t := &TSMTree{
-		dataDir:    dataDir,
-		mem:        &Memtable{data: make(map[string][]Point)},
-		maxMemSize: maxMemSize,
+type Config struct {
+	MaxMemSize    int
+	DataDir       string
+	FlushInterval time.Duration
+}
+
+func DefaultConfig() Config {
+	return Config{
+		MaxMemSize:    1024 * 1024 * 10, // 10 mb
+		DataDir:       "./serie",
+		FlushInterval: time.Minute * 10,
 	}
-	t.flushTicker = time.NewTicker(10 * time.Second)
+}
+
+func NewTSMTree(conf Config) *TSMTree {
+	t := &TSMTree{
+		dataDir:     conf.DataDir,
+		mem:         &Memtable{data: make(map[string][]Point)},
+		maxMemSize:  conf.MaxMemSize,
+		done:        make(chan struct{}),
+		flushTicker: time.NewTicker(conf.FlushInterval),
+	}
+	t.flushTicker = time.NewTicker(conf.FlushInterval)
+	go t.flushBackgroundJob()
+
 	return t
+}
+
+func (t *TSMTree) flushBackgroundJob() {
+	for {
+		select {
+		case <-t.done:
+			return
+		case <-t.flushTicker.C:
+			if err := t.Flush(); err != nil {
+				log.Printf("got error while flushing: %v", err)
+			}
+		}
+	}
 }
 
 func (t *TSMTree) Write(key string, timestamp int64, val float64) error {

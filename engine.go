@@ -522,21 +522,6 @@ func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
 	return res, nil
 }
 
-// type TSMFile struct {
-// 	path     string
-// 	file     *os.File
-// 	index    map[string][]IndexEntry
-// 	writePos int64
-// }
-
-// type IndexEntry struct {
-// 	MinTime int64
-// 	MaxTime int64
-// 	Offset  int64
-// 	Size    int64
-// }
-
-// encodeIndex writes
 func (t *TSMFile) encodeIndex() ([]byte, error) {
 	var b bytes.Buffer
 	if err := binary.Write(&b, binary.LittleEndian, uint16(len(t.index))); err != nil {

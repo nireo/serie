@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/golang/snappy"
+	"github.com/rs/zerolog"
 )
 
 // engine.go -- handles all of the internal storage of the data. The TSMTree is a LSM-tree that is
@@ -43,6 +43,7 @@ type Point struct {
 }
 
 type TSMTree struct {
+	log         zerolog.Logger
 	dataDir     string
 	mem         *Memtable
 	immutable   []*Memtable
@@ -100,6 +101,8 @@ func NewTSMTree(conf Config) *TSMTree {
 		done:        make(chan struct{}),
 		flushTicker: time.NewTicker(conf.FlushInterval),
 	}
+
+	t.log = zerolog.New(os.Stderr).With().Timestamp().Logger()
 	t.flushTicker = time.NewTicker(conf.FlushInterval)
 	go t.flushBackgroundJob()
 
@@ -112,8 +115,9 @@ func (t *TSMTree) flushBackgroundJob() {
 		case <-t.done:
 			return
 		case <-t.flushTicker.C:
+			t.log.Info().Msg("starting to flush memtables")
 			if err := t.Flush(); err != nil {
-				log.Printf("got error while flushing: %v", err)
+				t.log.Err(err).Msg("error flushing during background job")
 			}
 		}
 	}
@@ -128,6 +132,7 @@ func (t *TSMTree) Write(key string, timestamp int64, val float64) error {
 	t.mem.size += 16
 
 	if t.mem.size >= t.maxMemSize {
+		t.log.Info().Msg("writable memtable reached maximum capacity")
 		t.immutable = append(t.immutable, t.mem)
 		t.mem = &Memtable{data: make(map[string][]Point)}
 	}
@@ -261,6 +266,7 @@ func (t *TSMTree) Flush() error {
 		return nil
 	}
 
+	t.log.Info().Int("tableCount", len(t.immutable)).Msg("flushing tableCount amount of tables")
 	var wg sync.WaitGroup
 	errorChan := make(chan error, len(t.immutable))
 
@@ -290,6 +296,8 @@ func (t *TSMTree) Flush() error {
 }
 
 func (t *TSMTree) Close() error {
+	t.log.Info().Msg("closing the database")
+
 	if err := t.Flush(); err != nil {
 		return err
 	}
@@ -304,6 +312,7 @@ func (t *TSMTree) Close() error {
 }
 
 func (t *TSMTree) flushMemtable(table *Memtable) error {
+	t.log.Info().Msg("creating a tsm file from memtable")
 	file, err := t.createTSMFile()
 	if err != nil {
 		return err
@@ -314,14 +323,17 @@ func (t *TSMTree) flushMemtable(table *Memtable) error {
 			return err
 		}
 	}
+	t.log.Info().Msg("wrote points into tsm file")
 
 	if err := file.createIndexFile(); err != nil {
 		return err
 	}
+	t.log.Info().Msg("created a tsm index file")
 
 	if err := file.finalize(); err != nil {
 		return err
 	}
+	t.log.Info().Msg("finalized tsm index file")
 
 	t.files = append(t.files, file)
 	return nil

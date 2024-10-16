@@ -3,6 +3,7 @@ package serie
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -101,6 +102,11 @@ func NewTSMTree(conf Config) *TSMTree {
 		maxMemSize:  conf.MaxMemSize,
 		done:        make(chan struct{}),
 		flushTicker: time.NewTicker(conf.FlushInterval),
+	}
+
+	err := os.Mkdir(conf.DataDir, os.ModePerm)
+	if err != nil {
+		return nil
 	}
 
 	t.log = zerolog.New(os.Stderr).With().Timestamp().Logger()
@@ -730,4 +736,50 @@ func (t *TSMTree) parseDataDir() error {
 
 	t.files = tsmFiles
 	return nil
+}
+
+const (
+	aggFloat = iota
+	aggInt
+)
+
+type aggregateResult struct {
+	intValue int64
+	floatVal float64
+	kind     int
+}
+
+func sumUpValues(points []Point) float64 {
+	pointSum := float64(0.0)
+	for _, p := range points {
+		pointSum += p.Value
+	}
+
+	return pointSum
+}
+
+func (t *TSMTree) aggregate(funcName, metric string, minTime, maxTime int64) (aggregateResult, error) {
+	points, err := t.Read(metric, minTime, maxTime)
+	if err != nil {
+		return aggregateResult{}, err
+	}
+
+	if len(points) == 0 {
+		return aggregateResult{}, errors.New("no points to aggregate")
+	}
+
+	switch {
+	case funcName == "avg":
+		return aggregateResult{floatVal: sumUpValues(points) / float64(len(points)), kind: aggFloat}, nil
+	case funcName == "sum":
+		return aggregateResult{floatVal: sumUpValues(points), kind: aggFloat}, nil
+	case funcName == "count":
+		return aggregateResult{intValue: int64(len(points)), kind: aggInt}, nil
+	case funcName == "min":
+		return aggregateResult{floatVal: points[0].Value, kind: aggFloat}, nil // already sorted so the smallest element is the first element
+	case funcName == "max":
+		return aggregateResult{floatVal: points[len(points)-1].Value, kind: aggFloat}, nil // already sorted so the smallest element is the first element
+	}
+
+	return aggregateResult{}, errors.New("unrecognized function")
 }

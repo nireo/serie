@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"math/rand"
 	"os"
@@ -10,15 +11,28 @@ import (
 	"github.com/nireo/serie"
 )
 
-const (
-	numMetrics     = 100
-	numDataPoints  = 100000000
-	numConcurrent  = 10
-	readConcurrent = 5
-	timeRange      = 24 * time.Hour
+var (
+	numMetrics     int
+	numDataPoints  int
+	numConcurrent  int
+	readConcurrent int
+	timeRange      time.Duration
+	dataDir        string
+	readFromFiles  bool
 )
 
+func init() {
+	flag.IntVar(&numMetrics, "metrics", 100, "Number of metrics to generate")
+	flag.IntVar(&numDataPoints, "points", 1000000, "Total number of data points to write")
+	flag.IntVar(&numConcurrent, "write-concurrency", 10, "Number of concurrent write goroutines")
+	flag.IntVar(&readConcurrent, "read-concurrency", 5, "Number of concurrent read goroutines")
+	flag.DurationVar(&timeRange, "time-range", 24*time.Hour, "Time range for data points")
+	flag.StringVar(&dataDir, "data-dir", "./space_analyzer", "Directory to store TSMTree data")
+	flag.BoolVar(&readFromFiles, "from-files", false, "If memtables should be dumped to disk and then read from")
+}
+
 func main() {
+	flag.Parse()
 	// Set up the TSMTree
 	config := serie.DefaultConfig()
 	config.DataDir = "./stress_test_data"
@@ -29,6 +43,10 @@ func main() {
 
 	fmt.Println("Writing data...")
 	writeData(tree)
+
+	if readFromFiles {
+		tree.Flush()
+	}
 
 	fmt.Println("Reading and verifying data...")
 	readAndVerifyData(tree)

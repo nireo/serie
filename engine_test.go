@@ -19,11 +19,14 @@ func createTestTreeInTmpDir(t *testing.T, maxMemSize int) (*TSMTree, func()) {
 	}
 
 	// low size to force multiple immutable files
-	tree := NewTSMTree(Config{
+	tree, err := NewTSMTree(Config{
 		DataDir:       tempDir,
 		MaxMemSize:    maxMemSize,
 		FlushInterval: 1 * time.Minute, // ensure that no flushes happen during this test.
 	})
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
 
 	return tree, func() {
 		tree.Close()
@@ -407,11 +410,15 @@ func TestParseDataDir(t *testing.T) {
 		t.Fatalf("failed to close tsm tree: %v", err)
 	}
 
-	tree2 := NewTSMTree(Config{
+	tree2, err := NewTSMTree(Config{
 		DataDir:       tree.dataDir,
 		MaxMemSize:    256,
 		FlushInterval: 1 * time.Minute, // ensure that no flushes happen during this test.
 	})
+	if err != nil {
+		t.Fatalf("error creating new tree: %v", err)
+	}
+
 	if err := tree2.parseDataDir(); err != nil {
 		t.Fatalf("error parsing data dir: %v", err)
 	}
@@ -430,4 +437,133 @@ func TestParseDataDir(t *testing.T) {
 	if !reflect.DeepEqual(gotIndexEntriesForPath, expectedIndexEntriesForPath) {
 		t.Fatalf("parsed file indecies differ\n\tgot: %+v\n\t want: %+v", gotIndexEntriesForPath, expectedFileCount)
 	}
+}
+
+func TestTSMTreeGroupBy(t *testing.T) {
+	tree, cleanup := createTestTreeInTmpDir(t, 1000)
+	defer cleanup()
+
+	testData := []Point{
+		{Metric: "cpu.usage", Timestamp: 1000, Value: 50.0, Tags: map[string]string{"host": "server1", "dc": "us-west"}},
+		{Metric: "cpu.usage", Timestamp: 2000, Value: 60.0, Tags: map[string]string{"host": "server1", "dc": "us-west"}},
+		{Metric: "cpu.usage", Timestamp: 3000, Value: 70.0, Tags: map[string]string{"host": "server2", "dc": "us-east"}},
+		{Metric: "cpu.usage", Timestamp: 4000, Value: 80.0, Tags: map[string]string{"host": "server2", "dc": "us-east"}},
+		{Metric: "cpu.usage", Timestamp: 5000, Value: 90.0, Tags: map[string]string{"host": "server3", "dc": "eu-central"}},
+	}
+
+	err := tree.WriteBatch(testData)
+	if err != nil {
+		t.Fatalf("Failed to write test data: %v", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "got points: %+v", tree.mem.data)
+
+	tests := []struct {
+		name              string
+		tagName           string
+		aggregateFunction string
+		expectedResult    map[string]float64
+		expectedErrorMsg  string
+	}{
+		{
+			name:              "Sum by host",
+			tagName:           "host",
+			aggregateFunction: "sum",
+			expectedResult: map[string]float64{
+				"server1": 110.0,
+				"server2": 150.0,
+				"server3": 90.0,
+			},
+		},
+		{
+			name:              "Average by dc",
+			tagName:           "dc",
+			aggregateFunction: "avg",
+			expectedResult: map[string]float64{
+				"us-west":    55.0,
+				"us-east":    75.0,
+				"eu-central": 90.0,
+			},
+		},
+		{
+			name:              "Count by host",
+			tagName:           "host",
+			aggregateFunction: "count",
+			expectedResult: map[string]float64{
+				"server1": 2,
+				"server2": 2,
+				"server3": 1,
+			},
+		},
+		{
+			name:              "Min by dc",
+			tagName:           "dc",
+			aggregateFunction: "min",
+			expectedResult: map[string]float64{
+				"us-west":    50.0,
+				"us-east":    70.0,
+				"eu-central": 90.0,
+			},
+		},
+		{
+			name:              "Max by host",
+			tagName:           "host",
+			aggregateFunction: "max",
+			expectedResult: map[string]float64{
+				"server1": 60.0,
+				"server2": 80.0,
+				"server3": 90.0,
+			},
+		},
+		{
+			name:              "Invalid aggregate function",
+			tagName:           "host",
+			aggregateFunction: "invalid",
+			expectedErrorMsg:  "unrecognized function",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tree.groupBy(tt.tagName, tt.aggregateFunction, "cpu.usage", 0, 6000)
+
+			if tt.expectedErrorMsg != "" {
+				if err == nil || err.Error() != tt.expectedErrorMsg {
+					t.Errorf("Expected error with message '%s', got: %v", tt.expectedErrorMsg, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			if !reflect.DeepEqual(result, tt.expectedResult) {
+				t.Errorf("Unexpected result.\nExpected: %v\nGot: %v", tt.expectedResult, result)
+			}
+		})
+	}
+
+	// Test with non-existent tag
+	t.Run("Non-existent tag", func(t *testing.T) {
+		result, err := tree.groupBy("non_existent_tag", "sum", "cpu.usage", 0, 6000)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		expected := map[string]float64{"<no_tag>": 350.0}
+		if !reflect.DeepEqual(result, expected) {
+			t.Errorf("Unexpected result for non-existent tag.\nExpected: %v\nGot: %v", expected, result)
+		}
+	})
+
+	// Test with empty time range
+	t.Run("Empty time range", func(t *testing.T) {
+		result, err := tree.groupBy("host", "sum", "cpu.usage", 6000, 7000)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if len(result) != 0 {
+			t.Errorf("Expected empty result for empty time range, got: %v", result)
+		}
+	})
 }

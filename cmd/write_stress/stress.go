@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"sync"
@@ -36,7 +37,10 @@ func main() {
 	// Set up the TSMTree
 	config := serie.DefaultConfig()
 	config.DataDir = "./stress_test_data"
-	tree := serie.NewTSMTree(config)
+	tree, err := serie.NewTSMTree(config)
+	if err != nil {
+		log.Fatalln("failed to setup tsm tree ", err)
+	}
 	defer tree.Close()
 
 	os.MkdirAll(config.DataDir, 0755)

@@ -56,11 +56,17 @@ type TSMTree struct {
 	done        chan struct{}
 }
 
+// Memtable is the in-memory table to query points fast that more fresh data is easily retrieved.
+// The memtables are then pushed into a list of immutable tables which will be flushed to disk.
+// The flush timing and the maximum mem size can be configured to fit the system and the workload.
 type Memtable struct {
 	data map[string][]Point
 	size int
 }
 
+// TSMFile is a read-only file on disk that contains an index and pointer to path.
+// When searching for given metrics and keys in a timeframe we can use the index
+// to look at them.
 type TSMFile struct {
 	mu       sync.RWMutex
 	path     string
@@ -69,6 +75,9 @@ type TSMFile struct {
 	writePos int64
 }
 
+// IndexEntry is used that we can efficiently find the points in a given TSM file.
+// The offset points to the offset in the file and size determines the size of the
+// COMPRESSED size.
 type IndexEntry struct {
 	MinTime int64
 	MaxTime int64
@@ -87,6 +96,11 @@ type Config struct {
 	FlushInterval time.Duration
 }
 
+type TagIndex struct {
+	mu    sync.RWMutex
+	index map[string]map[string]struct{}
+}
+
 func DefaultConfig() Config {
 	return Config{
 		MaxMemSize:    1024 * 1024 * 10, // 10 mb
@@ -95,25 +109,26 @@ func DefaultConfig() Config {
 	}
 }
 
-func NewTSMTree(conf Config) *TSMTree {
+func NewTSMTree(conf Config) (*TSMTree, error) {
 	t := &TSMTree{
 		dataDir:     conf.DataDir,
 		mem:         &Memtable{data: make(map[string][]Point)},
 		maxMemSize:  conf.MaxMemSize,
-		done:        make(chan struct{}),
 		flushTicker: time.NewTicker(conf.FlushInterval),
+		done:        make(chan struct{}),
+		mu:          sync.RWMutex{},
 	}
 
-	err := os.Mkdir(conf.DataDir, os.ModePerm)
+	err := os.MkdirAll(conf.DataDir, os.ModePerm)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	t.log = zerolog.New(os.Stderr).With().Timestamp().Logger()
 	t.flushTicker = time.NewTicker(conf.FlushInterval)
 	go t.flushBackgroundJob()
 
-	return t
+	return t, nil
 }
 
 func (t *TSMTree) flushBackgroundJob() {
@@ -148,48 +163,33 @@ func (t *TSMTree) Write(key string, timestamp int64, val float64) error {
 }
 
 func (t *TSMTree) WriteBatch(points []Point) error {
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-	const batchSize = 2048
-	var wg sync.WaitGroup
-	errorChan := make(chan error, (len(points)+batchSize-1)/batchSize)
+	for _, p := range points {
+		t.mem.data[p.Metric] = append(t.mem.data[p.Metric], Point{
+			Timestamp: p.Timestamp,
+			Value:     p.Value,
+			Tags:      p.Tags,
+		})
+		t.mem.size += 16 + estimateTagSize(p.Tags)
 
-	for i := 0; i < len(points); i += batchSize {
-		wg.Add(1)
-		go func(start int) {
-			defer wg.Done()
-			end := start + batchSize
-			if end > len(points) {
-				end = len(points)
-			}
-			if err := t.writeBatch(points[start:end]); err != nil {
-				errorChan <- err
-			}
-		}(i)
-	}
-
-	go func() {
-		wg.Wait()
-		close(errorChan)
-	}()
-
-	for err := range errorChan {
-		if err != nil {
-			return err
+		if t.mem.size >= t.maxMemSize {
+			t.immutable = append(t.immutable, t.mem)
+			t.mem = &Memtable{data: make(map[string][]Point)}
 		}
 	}
 
 	return nil
 }
 
-func (t *TSMTree) writeBatch(points []Point) error {
-	for _, p := range points {
-		if err := t.Write(p.Metric, p.Timestamp, p.Value); err != nil {
-			return err
-		}
+// estimateTagSize calculates an approximate size of the tags
+func estimateTagSize(tags map[string]string) int {
+	size := 0
+	for k, v := range tags {
+		size += len(k) + len(v)
 	}
-	return nil
+	return size
 }
 
 func (t *TSMTree) Read(key string, minTime, maxTime int64) ([]Point, error) {
@@ -782,4 +782,76 @@ func (t *TSMTree) aggregate(funcName, metric string, minTime, maxTime int64) (ag
 	}
 
 	return aggregateResult{}, errors.New("unrecognized function")
+}
+
+func (t *TSMTree) groupBy(tagName, aggregateFunction, metric string, minTime, maxTime int64) (map[string]float64, error) {
+	points, err := t.Read(metric, minTime, maxTime)
+	if err != nil {
+		return nil, err
+	}
+
+	switch aggregateFunction {
+	case "sum":
+		sumPerTags := make(map[string]float64)
+		for _, p := range points {
+			tagValue, ok := p.Tags[tagName]
+			if !ok {
+				tagValue = "<no_tag>"
+			}
+			sumPerTags[tagValue] += p.Value
+		}
+		return sumPerTags, nil
+	case "avg":
+		sumPerTags := make(map[string]float64)
+		countPerTags := make(map[string]int)
+		for _, p := range points {
+			tagValue, ok := p.Tags[tagName]
+			if !ok {
+				tagValue = "<no_tag>"
+			}
+			sumPerTags[tagValue] += p.Value
+			countPerTags[tagValue]++
+		}
+		avgPerTags := make(map[string]float64)
+		for tagValue, sum := range sumPerTags {
+			avgPerTags[tagValue] = sum / float64(countPerTags[tagValue])
+		}
+		return avgPerTags, nil
+	case "count":
+		countPerTags := make(map[string]float64)
+		for _, p := range points {
+			tagValue, ok := p.Tags[tagName]
+			if !ok {
+				tagValue = "<no_tag>"
+			}
+			countPerTags[tagValue]++
+		}
+		return countPerTags, nil
+	case "min":
+		minPerTags := make(map[string]float64)
+		for _, p := range points {
+			tagValue, ok := p.Tags[tagName]
+			if !ok {
+				tagValue = "<no_tag>"
+			}
+			if currentMin, exists := minPerTags[tagValue]; !exists || p.Value < currentMin {
+				minPerTags[tagValue] = p.Value
+			}
+		}
+		return minPerTags, nil
+	case "max":
+		maxPerTags := make(map[string]float64)
+		for _, p := range points {
+			tagValue, ok := p.Tags[tagName]
+			if !ok {
+				tagValue = "<no_tag>"
+			}
+			if currentMax, exists := maxPerTags[tagValue]; !exists || p.Value > currentMax {
+				maxPerTags[tagValue] = p.Value
+			}
+		}
+		return maxPerTags, nil
+	}
+
+	return nil, errors.New("unrecognized function")
 }

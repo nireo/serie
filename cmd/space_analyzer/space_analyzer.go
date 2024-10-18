@@ -5,6 +5,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -37,7 +38,10 @@ func main() {
 	flag.Parse()
 	config := serie.DefaultConfig()
 	config.DataDir = dataDir
-	tree := serie.NewTSMTree(config)
+	tree, err := serie.NewTSMTree(config)
+	if err != nil {
+		log.Fatalln("failed to setup tsm tree ", err)
+	}
 
 	os.MkdirAll(config.DataDir, 0755)
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"sync"
@@ -26,7 +27,10 @@ func main() {
 	config.DataDir = "./data"
 	config.MaxMemSize = 256 * 512
 	config.FlushInterval = flushInterval
-	tree := serie.NewTSMTree(config)
+	tree, err := serie.NewTSMTree(config)
+	if err != nil {
+		log.Fatalln("failed to setup tsm tree ", err)
+	}
 	defer tree.Close()
 	defer os.RemoveAll(config.DataDir)
 

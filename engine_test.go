@@ -456,8 +456,6 @@ func TestTSMTreeGroupBy(t *testing.T) {
 		t.Fatalf("Failed to write test data: %v", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "got points: %+v", tree.mem.data)
-
 	tests := []struct {
 		name              string
 		tagName           string

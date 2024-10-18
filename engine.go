@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -784,74 +785,144 @@ func (t *TSMTree) aggregate(funcName, metric string, minTime, maxTime int64) (ag
 	return aggregateResult{}, errors.New("unrecognized function")
 }
 
-func (t *TSMTree) groupBy(tagName, aggregateFunction, metric string, minTime, maxTime int64) (map[string]float64, error) {
+func (t *TSMTree) groupBy(tagName, aggregateFunction string, metric string, minTime, maxTime int64) (map[string]float64, error) {
 	points, err := t.Read(metric, minTime, maxTime)
 	if err != nil {
 		return nil, err
 	}
 
-	switch aggregateFunction {
-	case "sum":
-		sumPerTags := make(map[string]float64)
-		for _, p := range points {
-			tagValue, ok := p.Tags[tagName]
-			if !ok {
-				tagValue = "<no_tag>"
-			}
-			sumPerTags[tagValue] += p.Value
+	groupedPoints := make(map[string][]float64)
+	for _, p := range points {
+		tagValue, ok := p.Tags[tagName]
+		if !ok {
+			tagValue = "<no_tag>"
 		}
-		return sumPerTags, nil
-	case "avg":
-		sumPerTags := make(map[string]float64)
-		countPerTags := make(map[string]int)
-		for _, p := range points {
-			tagValue, ok := p.Tags[tagName]
-			if !ok {
-				tagValue = "<no_tag>"
-			}
-			sumPerTags[tagValue] += p.Value
-			countPerTags[tagValue]++
-		}
-		avgPerTags := make(map[string]float64)
-		for tagValue, sum := range sumPerTags {
-			avgPerTags[tagValue] = sum / float64(countPerTags[tagValue])
-		}
-		return avgPerTags, nil
-	case "count":
-		countPerTags := make(map[string]float64)
-		for _, p := range points {
-			tagValue, ok := p.Tags[tagName]
-			if !ok {
-				tagValue = "<no_tag>"
-			}
-			countPerTags[tagValue]++
-		}
-		return countPerTags, nil
-	case "min":
-		minPerTags := make(map[string]float64)
-		for _, p := range points {
-			tagValue, ok := p.Tags[tagName]
-			if !ok {
-				tagValue = "<no_tag>"
-			}
-			if currentMin, exists := minPerTags[tagValue]; !exists || p.Value < currentMin {
-				minPerTags[tagValue] = p.Value
-			}
-		}
-		return minPerTags, nil
-	case "max":
-		maxPerTags := make(map[string]float64)
-		for _, p := range points {
-			tagValue, ok := p.Tags[tagName]
-			if !ok {
-				tagValue = "<no_tag>"
-			}
-			if currentMax, exists := maxPerTags[tagValue]; !exists || p.Value > currentMax {
-				maxPerTags[tagValue] = p.Value
-			}
-		}
-		return maxPerTags, nil
+		groupedPoints[tagValue] = append(groupedPoints[tagValue], p.Value)
 	}
 
-	return nil, errors.New("unrecognized function")
+	result := make(map[string]float64)
+
+	switch aggregateFunction {
+	case "sum":
+		for tagValue, values := range groupedPoints {
+			result[tagValue] = sum(values)
+		}
+	case "avg":
+		for tagValue, values := range groupedPoints {
+			result[tagValue] = average(values)
+		}
+	case "count":
+		for tagValue, values := range groupedPoints {
+			result[tagValue] = float64(len(values))
+		}
+	case "min":
+		for tagValue, values := range groupedPoints {
+			result[tagValue] = min(values)
+		}
+	case "max":
+		for tagValue, values := range groupedPoints {
+			result[tagValue] = max(values)
+		}
+	case "median":
+		for tagValue, values := range groupedPoints {
+			result[tagValue] = median(values)
+		}
+	case "percentile90":
+		for tagValue, values := range groupedPoints {
+			result[tagValue] = percentile(values, 90)
+		}
+	case "stddev":
+		for tagValue, values := range groupedPoints {
+			result[tagValue] = standardDeviation(values)
+		}
+	case "range":
+		for tagValue, values := range groupedPoints {
+			result[tagValue] = rangeValue(values)
+		}
+	default:
+		return nil, errors.New("unrecognized function")
+	}
+
+	return result, nil
+}
+
+func sum(values []float64) float64 {
+	var sum float64
+	for _, v := range values {
+		sum += v
+	}
+	return sum
+}
+
+func average(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	return sum(values) / float64(len(values))
+}
+
+func min(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	min := values[0]
+	for _, v := range values[1:] {
+		if v < min {
+			min = v
+		}
+	}
+	return min
+}
+
+func max(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	max := values[0]
+	for _, v := range values[1:] {
+		if v > max {
+			max = v
+		}
+	}
+	return max
+}
+
+func median(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sort.Float64s(values)
+	mid := len(values) / 2
+	if len(values)%2 == 0 {
+		return (values[mid-1] + values[mid]) / 2
+	}
+	return values[mid]
+}
+
+func percentile(values []float64, p float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sort.Float64s(values)
+	index := int(math.Ceil((p / 100) * float64(len(values))))
+	return values[index-1]
+}
+
+func standardDeviation(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	avg := average(values)
+	var sumSquares float64
+	for _, v := range values {
+		sumSquares += (v - avg) * (v - avg)
+	}
+	return math.Sqrt(sumSquares / float64(len(values)))
+}
+
+func rangeValue(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	return max(values) - min(values)
 }

@@ -112,3 +112,52 @@ func TestQueryBuilder(t *testing.T) {
 		})
 	}
 }
+
+func TestParseQuery(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected *query
+		wantErr  bool
+	}{
+		{
+			name:  "Valid query with two aggregates and two tags",
+			input: "SELECT avg, sum FROM metric GROUP BY tag1, tag2",
+			expected: &query{
+				aggregates: []string{"avg", "sum"},
+				metric:     "metric",
+				groupBy:    map[string]string{"tag1": "tag1", "tag2": "tag2"},
+			},
+			wantErr: false,
+		},
+		{
+			name:  "Valid query with one aggregate and no tags",
+			input: "SELECT count FROM metric",
+			expected: &query{
+				aggregates: []string{"count"},
+				metric:     "metric",
+				groupBy:    map[string]string{},
+			},
+			wantErr: false,
+		},
+		{
+			name:     "Invalid query - missing FROM",
+			input:    "SELECT avg, sum metric GROUP BY tag1, tag2",
+			expected: nil,
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseQuery(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseQuery() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.expected) {
+				t.Errorf("parseQuery() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}

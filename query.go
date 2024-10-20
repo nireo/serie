@@ -145,9 +145,9 @@ func (l *lexer) tokenize() ([]token, error) {
 // Here the average temperature is measured for each location in the dataset.
 
 type query struct {
-	selectedFields  []string
-	metric          string
-	wantedTagValues map[string]string
+	aggregates []string
+	metric     string
+	groupBy    map[string]string
 }
 
 type queryNode interface {
@@ -376,4 +376,38 @@ func (qb *queryBuilder) getRootQueryNode() (queryNode, error) {
 	}
 
 	return nil, errors.New("unrecognized statement")
+}
+
+func parseQuery(input string) (*query, error) {
+	parts := strings.Fields(input)
+	if len(parts) < 4 || parts[0] != "SELECT" {
+		return nil, fmt.Errorf("invalid query format")
+	}
+
+	q := &query{
+		groupBy: make(map[string]string),
+	}
+
+	aggregateEnd := 0
+	for i, part := range parts[1:] {
+		if part == "FROM" {
+			aggregateEnd = i + 1
+			break
+		}
+		q.aggregates = append(q.aggregates, strings.TrimSuffix(part, ","))
+	}
+
+	if aggregateEnd == 0 {
+		return nil, fmt.Errorf("missing FROM clause")
+	}
+
+	q.metric = parts[aggregateEnd+1]
+	if len(parts) > aggregateEnd+3 {
+		for _, tag := range parts[aggregateEnd+4:] {
+			tag = strings.TrimSuffix(tag, ",")
+			q.groupBy[tag] = tag
+		}
+	}
+
+	return q, nil
 }

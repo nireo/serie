@@ -127,7 +127,7 @@ func TestParseQuery(t *testing.T) {
 			expected: &query{
 				aggregates: []string{"avg", "sum"},
 				metric:     "metric",
-				groupBy:    map[string]string{"tag1": "tag1", "tag2": "tag2"},
+				groupBy:    []string{"tag1", "tag2"},
 				timeStart:  1609459200,
 				timeEnd:    1612137600,
 			},
@@ -139,7 +139,6 @@ func TestParseQuery(t *testing.T) {
 			expected: &query{
 				aggregates: []string{"count"},
 				metric:     "metric",
-				groupBy:    map[string]string{},
 				timeStart:  time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).Unix(),
 				timeEnd:    1612137600,
 			},
@@ -151,7 +150,6 @@ func TestParseQuery(t *testing.T) {
 			expected: &query{
 				aggregates: []string{"max"},
 				metric:     "metric",
-				groupBy:    map[string]string{},
 				timeStart:  1609459200,
 				timeEnd:    time.Now().Unix(),
 			},
@@ -163,7 +161,7 @@ func TestParseQuery(t *testing.T) {
 			expected: &query{
 				aggregates: []string{"min"},
 				metric:     "metric",
-				groupBy:    map[string]string{"tag1": "tag1"},
+				groupBy:    []string{"tag1"},
 				timeStart:  time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).Unix(),
 				timeEnd:    time.Now().Unix(),
 			},
@@ -175,7 +173,7 @@ func TestParseQuery(t *testing.T) {
 			expected: &query{
 				aggregates: []string{"avg", "sum"},
 				metric:     "metric",
-				groupBy:    map[string]string{"tag1": "tag1", "tag2": "tag2"},
+				groupBy:    []string{"tag1", "tag2"},
 				timeStart:  0,
 				timeEnd:    0,
 			},

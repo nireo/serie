@@ -928,16 +928,80 @@ func rangeValue(values []float64) float64 {
 }
 
 type QueryResult struct {
+	Aggregate string
+	Result    map[string]float64
 }
 
-func (t *TSMTree) Query(queryStr string) error {
-	_, err := parseQuery(queryStr)
+func aggregateMultipleTags(aggregate string, points []Point, wantedTags []string) (QueryResult, error) {
+	switch aggregate {
+	case "sum":
+		res := make(map[string]float64)
+
+		// TODO: maybe this should be a optional read method that does this automatically while reading
+		// This would be a lot quicker then.
+		var sb strings.Builder
+		for _, p := range points {
+			for _, wantedTag := range wantedTags {
+				_, err := sb.WriteString(p.Tags[wantedTag])
+				if err != nil {
+					return QueryResult{}, err
+				}
+				if err := sb.WriteByte(','); err != nil {
+					return QueryResult{}, err
+				}
+			}
+
+			res[sb.String()] += p.Value
+			sb.Reset()
+		}
+
+		return QueryResult{Aggregate: aggregate, Result: res}, nil
+	default:
+		panic("unrecognized aggregate")
+	}
+}
+
+func (t *TSMTree) Query(queryStr string) ([]QueryResult, error) {
+	query, err := parseQuery(queryStr)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	// It is expected that the resulting table has the same tags such that every point queried
 	// has the same tags.
 
-	return nil
+	groupBys := make(chan QueryResult)
+
+	points, err := t.Read(query.metric, query.timeStart, query.timeEnd)
+	if err != nil {
+		return nil, err
+	}
+
+	var wg sync.WaitGroup
+	for _, aggregate := range query.aggregates {
+		wg.Add(1)
+		go func(aggregateFunc string) {
+			defer wg.Done()
+
+			queryRes, err := aggregateMultipleTags(aggregateFunc, points, query.groupBy)
+			if err != nil {
+				t.log.Err(err).Msg("failed to aggregate query")
+				return
+			}
+
+			groupBys <- queryRes
+		}(aggregate)
+	}
+
+	go func() {
+		wg.Wait()
+		close(groupBys)
+	}()
+
+	var res []QueryResult
+	for m := range groupBys {
+		res = append(res, m)
+	}
+
+	return res, nil
 }

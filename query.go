@@ -148,7 +148,7 @@ func (l *lexer) tokenize() ([]token, error) {
 type query struct {
 	aggregates []string
 	metric     string
-	groupBy    map[string]string
+	groupBy    []string // list of tags to group by
 	timeStart  int64
 	timeEnd    int64
 }
@@ -387,9 +387,7 @@ func parseQuery(input string) (*query, error) {
 		return nil, fmt.Errorf("invalid query format")
 	}
 
-	q := &query{
-		groupBy: make(map[string]string),
-	}
+	q := &query{}
 
 	fromIndex := indexOf(parts, "FROM")
 	if fromIndex == -1 {
@@ -439,7 +437,7 @@ func parseQuery(input string) (*query, error) {
 				break
 			}
 			tag = strings.TrimSuffix(tag, ",")
-			q.groupBy[tag] = tag
+			q.groupBy = append(q.groupBy, tag)
 		}
 	}
 

@@ -926,3 +926,18 @@ func rangeValue(values []float64) float64 {
 	}
 	return max(values) - min(values)
 }
+
+type QueryResult struct {
+}
+
+func (t *TSMTree) Query(queryStr string) error {
+	_, err := parseQuery(queryStr)
+	if err != nil {
+		return nil
+	}
+
+	// It is expected that the resulting table has the same tags such that every point queried
+	// has the same tags.
+
+	return nil
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -148,6 +149,8 @@ type query struct {
 	aggregates []string
 	metric     string
 	groupBy    map[string]string
+	timeStart  int64
+	timeEnd    int64
 }
 
 type queryNode interface {
@@ -388,26 +391,74 @@ func parseQuery(input string) (*query, error) {
 		groupBy: make(map[string]string),
 	}
 
-	aggregateEnd := 0
-	for i, part := range parts[1:] {
-		if part == "FROM" {
-			aggregateEnd = i + 1
-			break
-		}
-		q.aggregates = append(q.aggregates, strings.TrimSuffix(part, ","))
-	}
-
-	if aggregateEnd == 0 {
+	fromIndex := indexOf(parts, "FROM")
+	if fromIndex == -1 {
 		return nil, fmt.Errorf("missing FROM clause")
 	}
+	q.aggregates = parseAggregates(parts[1:fromIndex])
 
-	q.metric = parts[aggregateEnd+1]
-	if len(parts) > aggregateEnd+3 {
-		for _, tag := range parts[aggregateEnd+4:] {
+	if fromIndex+1 >= len(parts) {
+		return nil, fmt.Errorf("missing metric")
+	}
+	q.metric = parts[fromIndex+1]
+
+	betweenIndex := indexOf(parts, "BETWEEN")
+	if betweenIndex != -1 {
+		if betweenIndex+1 >= len(parts) {
+			return nil, fmt.Errorf("invalid BETWEEN clause")
+		}
+		timeRange := strings.Split(parts[betweenIndex+1], ":")
+		if len(timeRange) != 2 {
+			return nil, fmt.Errorf("invalid time range format in BETWEEN clause")
+		}
+
+		var err error
+		if timeRange[0] != "" {
+			q.timeStart, err = strconv.ParseInt(timeRange[0], 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid start timestamp: %v", err)
+			}
+		} else {
+			q.timeStart = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+		}
+
+		if timeRange[1] != "" {
+			q.timeEnd, err = strconv.ParseInt(timeRange[1], 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid end timestamp: %v", err)
+			}
+		} else {
+			q.timeEnd = time.Now().Unix()
+		}
+	}
+
+	groupByIndex := indexOf(parts, "GROUP")
+	if groupByIndex != -1 && groupByIndex+1 < len(parts) && parts[groupByIndex+1] == "BY" {
+		for _, tag := range parts[groupByIndex+2:] {
+			if tag == "BETWEEN" {
+				break
+			}
 			tag = strings.TrimSuffix(tag, ",")
 			q.groupBy[tag] = tag
 		}
 	}
 
 	return q, nil
+}
+
+func indexOf(slice []string, item string) int {
+	for i, s := range slice {
+		if s == item {
+			return i
+		}
+	}
+	return -1
+}
+
+func parseAggregates(parts []string) []string {
+	var aggregates []string
+	for _, part := range parts {
+		aggregates = append(aggregates, strings.TrimSuffix(part, ","))
+	}
+	return aggregates
 }

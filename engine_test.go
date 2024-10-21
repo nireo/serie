@@ -693,3 +693,65 @@ func TestQuery(t *testing.T) {
 		})
 	}
 }
+
+func TestQueryPerformance(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping performance test in short mode")
+	}
+
+	tree, cleanup := createTestTreeInTmpDir(t, 1000000)
+	defer cleanup()
+
+	start := time.Now().Add(-90 * 24 * time.Hour)
+	end := time.Now().Unix()
+	interval := 60
+
+	hosts := []string{"server1", "server2", "server3", "server4", "server5"}
+	dcs := []string{"us-west", "us-east", "eu-central", "ap-southeast", "sa-east"}
+
+	var testData []Point
+	for ts := start.Unix(); ts <= end; ts += int64(interval) {
+		for i := 0; i < 5; i++ {
+			testData = append(testData, Point{
+				Metric:    "cpu_usage",
+				Timestamp: ts,
+				Value:     float64(50 + i*10),
+				Tags: map[string]string{
+					"host": hosts[i],
+					"dc":   dcs[i],
+				},
+			})
+		}
+	}
+
+	err := tree.WriteBatch(testData)
+	if err != nil {
+		t.Fatalf("Failed to write test data: %v", err)
+	}
+
+	query := fmt.Sprintf("SELECT avg, sum FROM cpu_usage GROUP BY host, dc BETWEEN %d:%d", start.Unix(), end)
+
+	start = time.Now()
+	result, err := tree.Query(query)
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+	duration := time.Since(start)
+
+	t.Logf("Query execution time: %v", duration)
+	t.Logf("Number of results: %d", len(result))
+
+	if len(result) != 2 {
+		t.Errorf("Expected 2 aggregate results, got %d", len(result))
+	}
+
+	for _, res := range result {
+		if len(res.Result) != 5 {
+			t.Errorf("Expected 5 group by results for aggregate %s, got %d", res.Aggregate, len(res.Result))
+		}
+	}
+
+	if duration > 5*time.Second {
+		t.Errorf("Query took too long: %v", duration)
+	}
+}

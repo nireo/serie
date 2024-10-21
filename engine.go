@@ -37,15 +37,23 @@ type Engine interface {
 	WriteBatch(points []Point) error
 }
 
+// Point represents a single point in a given dataset.
 type Point struct {
-	Metric    string  `json:"metric"`
-	Value     float64 `json:"value"`
-	Timestamp int64   `json:"timestamp"`
-	Tags      map[string]string
+	Metric    string            `json:"metric"`
+	Value     float64           `json:"value"`
+	Timestamp int64             `json:"timestamp"`
+	Tags      map[string]string `json:"tags"`
+}
+
+// MetricMetadata can optionally be defined for a given dataset such that the engine
+// knows more about what kind of data we are working with.
+type MetricMetadata struct {
+	Tags []string
 }
 
 type TSMTree struct {
 	log         zerolog.Logger
+	metrics     map[string]MetricMetadata
 	dataDir     string
 	mem         *Memtable
 	immutable   []*Memtable
@@ -423,6 +431,7 @@ func (f *TSMFile) write(key string, points []Point) error {
 	if err := binary.Write(f.file, binary.LittleEndian, uint32(len(compressedData))); err != nil {
 		return err
 	}
+
 	f.writePos += 4
 
 	n, err := f.file.Write(compressedData)
@@ -932,32 +941,29 @@ type QueryResult struct {
 	Result    map[string]float64
 }
 
-func aggregateMultipleTags(aggregate string, points []Point, wantedTags []string) (QueryResult, error) {
+func aggregateMultipleTags(aggregate string, points []Point, pointTags []string, wantedTags []string) (QueryResult, error) {
 	switch aggregate {
 	case "sum":
-		res := make(map[string]float64)
-
-		// TODO: maybe this should be a optional read method that does this automatically while reading
-		// This would be a lot quicker then.
-		var sb strings.Builder
-		for _, p := range points {
-			for _, wantedTag := range wantedTags {
-				_, err := sb.WriteString(p.Tags[wantedTag])
-				if err != nil {
-					return QueryResult{}, err
-				}
-				if err := sb.WriteByte(','); err != nil {
-					return QueryResult{}, err
-				}
-			}
-
-			res[sb.String()] += p.Value
-			sb.Reset()
+		res := make(map[string]float64, len(pointTags))
+		for i, tag := range pointTags {
+			res[tag] += points[i].Value
+		}
+		return QueryResult{Aggregate: aggregate, Result: res}, nil
+	case "avg":
+		sums := make(map[string]float64)
+		counts := make(map[string]int)
+		for i, tag := range pointTags {
+			sums[tag] += points[i].Value
+			counts[tag]++
 		}
 
+		res := make(map[string]float64, len(sums))
+		for key, sum := range sums {
+			res[key] = sum / float64(counts[key])
+		}
 		return QueryResult{Aggregate: aggregate, Result: res}, nil
 	default:
-		panic("unrecognized aggregate")
+		panic(fmt.Sprintf("unrecognized aggregate %s", aggregate))
 	}
 }
 
@@ -977,13 +983,34 @@ func (t *TSMTree) Query(queryStr string) ([]QueryResult, error) {
 		return nil, err
 	}
 
+	// pointsTags[i] is the wanted tags of point[i] in a string form such that they're easy to perform calculations on.
+	var sb strings.Builder
+	pointTags := make([]string, 0, len(points))
+	for _, p := range points {
+		for i, wantedTag := range query.groupBy {
+			_, err := sb.WriteString(p.Tags[wantedTag])
+			if err != nil {
+				return nil, err
+			}
+
+			if i < len(query.groupBy)-1 {
+				if err := sb.WriteByte(','); err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		pointTags = append(pointTags, sb.String())
+		sb.Reset()
+	}
+
 	var wg sync.WaitGroup
 	for _, aggregate := range query.aggregates {
 		wg.Add(1)
 		go func(aggregateFunc string) {
 			defer wg.Done()
 
-			queryRes, err := aggregateMultipleTags(aggregateFunc, points, query.groupBy)
+			queryRes, err := aggregateMultipleTags(aggregateFunc, points, pointTags, query.groupBy)
 			if err != nil {
 				t.log.Err(err).Msg("failed to aggregate query")
 				return
@@ -1004,4 +1031,9 @@ func (t *TSMTree) Query(queryStr string) ([]QueryResult, error) {
 	}
 
 	return res, nil
+}
+
+// AddMetricMetadata
+func (t *TSMTree) AddMetricMetadata(metric string, metadata MetricMetadata) {
+	t.metrics[metric] = metadata
 }

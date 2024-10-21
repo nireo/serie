@@ -213,13 +213,13 @@ func TestParseQuery(t *testing.T) {
 				return
 			}
 			if !tt.wantErr {
-				// For cases where timeEnd is expected to be Now(), we need to check separately
 				if tt.expected.timeEnd == time.Now().Unix() {
 					if got.timeEnd < time.Now().Add(-time.Second).Unix() || got.timeEnd > time.Now().Unix() {
 						t.Errorf("parseQuery() timeEnd = %v, want recent timestamp", got.timeEnd)
 					}
-					got.timeEnd = tt.expected.timeEnd // Set to same value for DeepEqual check
+					got.timeEnd = tt.expected.timeEnd
 				}
+
 				if !reflect.DeepEqual(got, tt.expected) {
 					t.Errorf("parseQuery() = %v, want %v", got, tt.expected)
 				}

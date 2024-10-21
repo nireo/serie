@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"reflect"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -564,4 +565,131 @@ func TestTSMTreeGroupBy(t *testing.T) {
 			t.Errorf("Expected empty result for empty time range, got: %v", result)
 		}
 	})
+}
+
+func compareQueryResults(t *testing.T, got, want []QueryResult) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Errorf("Result count mismatch. Got %d, want %d", len(got), len(want))
+		return
+	}
+
+	// Sort both slices by Aggregate field to ensure consistent ordering
+	sort.Slice(got, func(i, j int) bool { return got[i].Aggregate < got[j].Aggregate })
+	sort.Slice(want, func(i, j int) bool { return want[i].Aggregate < want[j].Aggregate })
+
+	for i := range got {
+		if got[i].Aggregate != want[i].Aggregate {
+			t.Errorf("Aggregate mismatch at index %d. Got %s, want %s", i, got[i].Aggregate, want[i].Aggregate)
+			continue
+		}
+		if !reflect.DeepEqual(got[i].Result, want[i].Result) {
+			t.Errorf("Result mismatch for aggregate %s.\nGot: %+v\nWant: %+v", got[i].Aggregate, got[i].Result, want[i].Result)
+		}
+	}
+}
+
+func TestQuery(t *testing.T) {
+	tree, cleanup := createTestTreeInTmpDir(t, 1000)
+	defer cleanup()
+
+	testData := []Point{
+		{Metric: "cpu_usage", Timestamp: 1609459200, Value: 50.0, Tags: map[string]string{"host": "server1", "dc": "us-west"}},
+		{Metric: "cpu_usage", Timestamp: 1609545600, Value: 60.0, Tags: map[string]string{"host": "server1", "dc": "us-west"}},
+		{Metric: "cpu_usage", Timestamp: 1609632000, Value: 70.0, Tags: map[string]string{"host": "server2", "dc": "us-east"}},
+		{Metric: "cpu_usage", Timestamp: 1609718400, Value: 80.0, Tags: map[string]string{"host": "server2", "dc": "us-east"}},
+		{Metric: "cpu_usage", Timestamp: 1609804800, Value: 90.0, Tags: map[string]string{"host": "server3", "dc": "eu-central"}},
+	}
+
+	err := tree.WriteBatch(testData)
+	if err != nil {
+		t.Fatalf("Failed to write test data: %v", err)
+	}
+
+	tests := []struct {
+		name           string
+		query          string
+		expectedResult []QueryResult
+		expectedError  string
+	}{
+		{
+			name:  "Basic query with avg and sum",
+			query: "SELECT avg, sum FROM cpu_usage GROUP BY host BETWEEN 1609459200:1612137600",
+			expectedResult: []QueryResult{
+				{
+					Aggregate: "avg",
+					Result: map[string]float64{
+						"server1": 55.0,
+						"server2": 75.0,
+						"server3": 90.0,
+					},
+				},
+				{
+					Aggregate: "sum",
+					Result: map[string]float64{
+						"server1": 110.0,
+						"server2": 150.0,
+						"server3": 90.0,
+					},
+				},
+			},
+		},
+		{
+			name:  "Query with multiple GROUP BY tags",
+			query: "SELECT avg FROM cpu_usage GROUP BY host, dc BETWEEN 1609459200:1612137600",
+			expectedResult: []QueryResult{
+				{
+					Aggregate: "avg",
+					Result: map[string]float64{
+						"server1,us-west":    55.0,
+						"server2,us-east":    75.0,
+						"server3,eu-central": 90.0,
+					},
+				},
+			},
+		},
+		{
+			name:  "Query with single aggregate",
+			query: "SELECT sum FROM cpu_usage GROUP BY dc BETWEEN 1609459200:1612137600",
+			expectedResult: []QueryResult{
+				{
+					Aggregate: "sum",
+					Result: map[string]float64{
+						"us-west":    110.0,
+						"us-east":    150.0,
+						"eu-central": 90.0,
+					},
+				},
+			},
+		},
+		{
+			name:  "Query with empty time range",
+			query: "SELECT avg FROM cpu_usage GROUP BY host BETWEEN 1612137600:1612137601",
+			expectedResult: []QueryResult{
+				{
+					Aggregate: "avg",
+					Result:    map[string]float64{},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tree.Query(tt.query)
+
+			if tt.expectedError != "" {
+				if err == nil || err.Error() != tt.expectedError {
+					t.Errorf("Expected error '%s', got: %v", tt.expectedError, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			compareQueryResults(t, result, tt.expectedResult)
+		})
+	}
 }

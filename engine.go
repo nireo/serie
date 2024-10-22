@@ -133,7 +133,7 @@ func NewTSMTree(conf Config) (*TSMTree, error) {
 		return nil, err
 	}
 
-	t.log = zerolog.New(os.Stderr).With().Timestamp().Logger()
+	t.log = zerolog.New(os.Stderr).With().Timestamp().Str("component", "engine").Logger()
 	t.flushTicker = time.NewTicker(conf.FlushInterval)
 	go t.flushBackgroundJob()
 

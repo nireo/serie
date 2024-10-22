@@ -100,11 +100,20 @@ func (h *HeartbeatManager) heartbeatLoop() {
 
 func (h *HeartbeatManager) checkAndSendHeartbeats() {
 	h.distributor.mu.Lock()
+	if len(h.distributor.Members) == 0 {
+		h.distributor.mu.Unlock()
+		return
+	}
+
 	now := time.Now()
 	deadNodes := make([]*Member, 0)
 	members := make([]*Member, len(h.distributor.Members))
 	copy(members, h.distributor.Members)
-	thisAddr := h.distributor.Members[0].Addr
+
+	var thisAddr string
+	if len(members) > 0 {
+		thisAddr = members[0].Addr
+	}
 
 	for _, member := range members {
 		lastHeartbeat, exists := h.distributor.heartbeats[member.Addr]
@@ -124,21 +133,23 @@ func (h *HeartbeatManager) checkAndSendHeartbeats() {
 	}
 	h.distributor.mu.Unlock()
 
-	var wg sync.WaitGroup
-	for _, member := range members {
-		if member.Addr == thisAddr || h.isNodeDead(member, deadNodes) {
-			continue
-		}
-
-		wg.Add(1)
-		go func(addr string) {
-			defer wg.Done()
-			if err := h.sendHeartbeat(addr, thisAddr); err != nil {
-				fmt.Printf("Failed to send heartbeat to %s: %v\n", addr, err)
+	if thisAddr != "" {
+		var wg sync.WaitGroup
+		for _, member := range members {
+			if member.Addr == thisAddr || h.isNodeDead(member, deadNodes) {
+				continue
 			}
-		}(member.Addr)
+
+			wg.Add(1)
+			go func(addr string) {
+				defer wg.Done()
+				if err := h.sendHeartbeat(addr, thisAddr); err != nil {
+					fmt.Printf("Failed to send heartbeat to %s: %v\n", addr, err)
+				}
+			}(member.Addr)
+		}
+		wg.Wait()
 	}
-	wg.Wait()
 }
 
 func (h *HeartbeatManager) isNodeDead(node *Member, deadNodes []*Member) bool {
@@ -263,4 +274,32 @@ func (d *Distributor) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) erro
 	// This method only logs the from id as being alive.
 	d.heartbeats[args.From] = time.Now()
 	return nil
+}
+
+func (d *Distributor) IsNodeHealthy(addr string) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	lastHeartbeat, exists := d.heartbeats[addr]
+	if !exists {
+		return false
+	}
+	return time.Since(lastHeartbeat) <= d.HeartbeatTimeout
+}
+
+func (d *Distributor) GetHealthyNodes() []*Member {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	healthyNodes := make([]*Member, 0)
+	now := time.Now()
+
+	for _, member := range d.Members {
+		lastHeartbeat, exists := d.heartbeats[member.Addr]
+		if exists && now.Sub(lastHeartbeat) <= d.HeartbeatTimeout {
+			healthyNodes = append(healthyNodes, member)
+		}
+	}
+
+	return healthyNodes
 }

@@ -118,12 +118,10 @@ func TestCompression(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			block := NewBlock()
 
-			// Compress
 			compressedTimestamps := block.CompressTimestamps(tt.points)
 			compressedValues := block.CompressValues(tt.points)
 			compressedTags := block.CompressTags(tt.points)
 
-			// Decompress into new points
 			decompressed := make([]Point, len(tt.points))
 
 			err := DecompressTimestamps(compressedTimestamps, decompressed)
@@ -141,7 +139,6 @@ func TestCompression(t *testing.T) {
 				t.Fatalf("Failed to decompress tags: %v", err)
 			}
 
-			// Compare results
 			if len(decompressed) != len(tt.points) {
 				t.Fatalf("Length mismatch: got %d, want %d", len(decompressed), len(tt.points))
 			}
@@ -174,7 +171,7 @@ func TestTimestampCompression(t *testing.T) {
 	}{
 		{
 			name:      "even intervals",
-			intervals: []int64{60, 60, 60, 60}, // Every minute
+			intervals: []int64{60, 60, 60, 60},
 			validate: func(original, decompressed []Point) error {
 				for i := 1; i < len(original); i++ {
 					delta := original[i].Timestamp - original[i-1].Timestamp
@@ -187,7 +184,7 @@ func TestTimestampCompression(t *testing.T) {
 		},
 		{
 			name:      "increasing intervals",
-			intervals: []int64{60, 120, 180, 240}, // Growing intervals
+			intervals: []int64{60, 120, 180, 240},
 			validate: func(original, decompressed []Point) error {
 				for i := 1; i < len(original); i++ {
 					delta := original[i].Timestamp - original[i-1].Timestamp
@@ -200,7 +197,7 @@ func TestTimestampCompression(t *testing.T) {
 		},
 		{
 			name:      "mixed intervals",
-			intervals: []int64{60, 30, 90, 45}, // Varying intervals
+			intervals: []int64{60, 30, 90, 45},
 			validate: func(original, decompressed []Point) error {
 				expectedIntervals := []int64{60, 30, 90, 45}
 				for i := 1; i < len(original); i++ {
@@ -221,7 +218,6 @@ func TestTimestampCompression(t *testing.T) {
 			now := time.Now().Unix()
 			current := now
 
-			// Generate points based on intervals
 			points = append(points, Point{Timestamp: current})
 			for _, interval := range tt.intervals {
 				current += interval
@@ -371,15 +367,14 @@ func TestCompressionSizes(t *testing.T) {
 	points := make([]Point, 1000)
 	now := time.Now().Unix()
 
-	// Generate test data with realistic patterns
 	for i := range points {
 		points[i] = Point{
-			Timestamp: now + int64(i*60),   // Every minute
-			Value:     100 + float64(i%10), // Repeating pattern
+			Timestamp: now + int64(i*60),
+			Value:     100 + float64(i%10),
 			Tags: map[string]string{
-				"host":   fmt.Sprintf("server%d", i%5), // 5 unique hosts
-				"region": fmt.Sprintf("region%d", i%3), // 3 unique regions
-				"dc":     fmt.Sprintf("dc%d", i%2),     // 2 unique datacenters
+				"host":   fmt.Sprintf("server%d", i%5),
+				"region": fmt.Sprintf("region%d", i%3),
+				"dc":     fmt.Sprintf("dc%d", i%2),
 			},
 		}
 	}
@@ -398,7 +393,6 @@ func TestCompressionSizes(t *testing.T) {
 	t.Logf("  Tags: %d bytes (%.2f bytes/point)",
 		len(compressedTags), float64(len(compressedTags))/float64(len(points)))
 
-	// Verify compression and decompression
 	decompressed := make([]Point, len(points))
 
 	err := DecompressTimestamps(compressedTimestamps, decompressed)
@@ -416,7 +410,6 @@ func TestCompressionSizes(t *testing.T) {
 		t.Fatalf("Failed to decompress tags: %v", err)
 	}
 
-	// Verify first and last points
 	if !reflect.DeepEqual(points[0], decompressed[0]) {
 		t.Error("First point mismatch")
 	}

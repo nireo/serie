@@ -18,6 +18,7 @@ Each file contains their own tests and each file also contains a high-level over
 - `query.go` implements a lexer and custom query language that can be used to query time series data.
 - `distributor.go` distributes nodes given a metric it chooses the nodes to distribute to using consistent hashing.
 - `multiplexer.go` combines the rpc service in distributor and the common http interface to communicate with nodes.
+- `encoding.go` contains some code to enconde entries reducing the space they take on disk.
 
 
 ## Configuration
@@ -82,6 +83,6 @@ func main() {
 		fmt.Println("Read points:", readPoints)
 	}
 
-  select {} // Keep the program running for the http service.
+	select {} // Keep the program running for the http service.
 }
 ```

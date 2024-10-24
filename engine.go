@@ -110,6 +110,13 @@ type TagIndex struct {
 	index map[string]map[string]struct{}
 }
 
+type ReadTransaction struct {
+	snapshot  map[string][]Point // snapshot of the current writable table
+	immutable []*Memtable        // snapshot of the immutable memtables
+	files     []*TSMFile         // snapshot of the current files
+	readTime  time.Time
+}
+
 func DefaultConfig() Config {
 	return Config{
 		MaxMemSize:    1024 * 1024 * 10, // 10 mb

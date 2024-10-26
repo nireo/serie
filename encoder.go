@@ -144,15 +144,13 @@ func (b *Block) CompressTags(points []Point) []byte {
 	return buf.Bytes()
 }
 
-func DecompressTimestamps(data []byte, points []Point) error {
-	if len(data) == 0 || len(points) == 0 {
+func DecompressTimestamps(reader *bytes.Reader, points []Point) error {
+	if reader.Len() == 0 || len(points) == 0 {
 		return nil
 	}
 
-	buf := bytes.NewReader(data)
-
 	var firstTimestamp int64
-	if err := binary.Read(buf, binary.LittleEndian, &firstTimestamp); err != nil {
+	if err := binary.Read(reader, binary.LittleEndian, &firstTimestamp); err != nil {
 		return fmt.Errorf("reading first timestamp: %w", err)
 	}
 	points[0].Timestamp = firstTimestamp
@@ -161,7 +159,7 @@ func DecompressTimestamps(data []byte, points []Point) error {
 		return nil
 	}
 
-	firstDelta, err := binary.ReadVarint(buf)
+	firstDelta, err := binary.ReadVarint(reader)
 	if err != nil {
 		return fmt.Errorf("reading first delta: %w", err)
 	}
@@ -171,7 +169,7 @@ func DecompressTimestamps(data []byte, points []Point) error {
 	prevDelta := firstDelta
 
 	for i := 2; i < len(points); i++ {
-		doubleDelta, err := binary.ReadVarint(buf)
+		doubleDelta, err := binary.ReadVarint(reader)
 		if err != nil {
 			return fmt.Errorf("reading delta at position %d: %w", i, err)
 		}
@@ -187,22 +185,20 @@ func DecompressTimestamps(data []byte, points []Point) error {
 	return nil
 }
 
-func DecompressValues(data []byte, points []Point) error {
-	if len(data) == 0 || len(points) == 0 {
+func DecompressValues(reader *bytes.Reader, points []Point) error {
+	if reader.Len() == 0 || len(points) == 0 {
 		return nil
 	}
 
-	buf := bytes.NewReader(data)
-
 	var firstValue float64
-	if err := binary.Read(buf, binary.LittleEndian, &firstValue); err != nil {
+	if err := binary.Read(reader, binary.LittleEndian, &firstValue); err != nil {
 		return fmt.Errorf("reading first value: %w", err)
 	}
 	points[0].Value = firstValue
 
 	prevValue := firstValue
 	for i := 1; i < len(points); i++ {
-		bits, err := binary.ReadUvarint(buf)
+		bits, err := binary.ReadUvarint(reader)
 		if err != nil {
 			return fmt.Errorf("reading value at position %d: %w", i, err)
 		}
@@ -216,26 +212,24 @@ func DecompressValues(data []byte, points []Point) error {
 	return nil
 }
 
-func DecompressTags(data []byte, points []Point, td *TagDictionary) error {
-	if len(data) == 0 || len(points) == 0 {
+func DecompressTags(reader *bytes.Reader, points []Point, td *TagDictionary) error {
+	if reader.Len() == 0 || len(points) == 0 {
 		return nil
 	}
 
-	buf := bytes.NewReader(data)
-
-	numTagKeys, err := binary.ReadUvarint(buf)
+	numTagKeys, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return fmt.Errorf("reading number of tag keys: %w", err)
 	}
 
 	for i := uint64(0); i < numTagKeys; i++ {
-		keyID, err := binary.ReadUvarint(buf)
+		keyID, err := binary.ReadUvarint(reader)
 		if err != nil {
 			return fmt.Errorf("reading tag key ID: %w", err)
 		}
 		tagKey := td.GetString(uint16(keyID))
 
-		numPoints, err := binary.ReadUvarint(buf)
+		numPoints, err := binary.ReadUvarint(reader)
 		if err != nil {
 			return fmt.Errorf("reading number of points for tag %s: %w", tagKey, err)
 		}
@@ -245,7 +239,7 @@ func DecompressTags(data []byte, points []Point, td *TagDictionary) error {
 		}
 
 		for j := uint64(0); j < numPoints; j++ {
-			valueID, err := binary.ReadUvarint(buf)
+			valueID, err := binary.ReadUvarint(reader)
 			if err != nil {
 				return fmt.Errorf("reading tag value ID at position %d: %w", j, err)
 			}
@@ -262,4 +256,97 @@ func DecompressTags(data []byte, points []Point, td *TagDictionary) error {
 	}
 
 	return nil
+}
+
+func (b *Block) encodeTagDictionary() ([]byte, error) {
+	var buf bytes.Buffer
+
+	if err := binary.Write(&buf, binary.LittleEndian, uint16(len(b.td.idToString))); err != nil {
+		return nil, err
+	}
+
+	for id, key := range b.td.idToString {
+		if err := binary.Write(&buf, binary.LittleEndian, id); err != nil {
+			return nil, err
+		}
+
+		if err := binary.Write(&buf, binary.LittleEndian, uint16(len(key))); err != nil {
+			return nil, err
+		}
+
+		if _, err := buf.WriteString(key); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+func decodeTagDictionary(reader *bytes.Reader) (*TagDictionary, error) {
+	var tagDictSize uint16
+	if err := binary.Read(reader, binary.LittleEndian, &tagDictSize); err != nil {
+		return nil, err
+	}
+
+	tagDict := &TagDictionary{
+		idToString: make(map[uint16]string, tagDictSize),
+	}
+
+	for i := uint16(0); i < tagDictSize; i++ {
+		var keyID uint16
+		var keyLen uint16
+		if err := binary.Read(reader, binary.LittleEndian, &keyID); err != nil {
+			return nil, err
+		}
+
+		if err := binary.Read(reader, binary.LittleEndian, &keyLen); err != nil {
+			return nil, err
+		}
+
+		keyBuf := make([]byte, keyLen)
+		if _, err := reader.Read(keyBuf); err != nil {
+			return nil, err
+		}
+		tagDict.idToString[keyID] = string(keyBuf)
+	}
+
+	return tagDict, nil
+}
+
+func EncodePointsIntoBlock(points []Point) ([]byte, error) {
+	// First encode the tags such that it builds the tag dictionary which we're going to encoding first.
+	b := NewBlock()
+
+	tagData := b.CompressTags(points)
+	timestampData := b.CompressTimestamps(points)
+	valueData := b.CompressValues(points)
+
+	encodedTagDict, err := b.encodeTagDictionary()
+	if err != nil {
+		return nil, err
+	}
+
+	res := make([]byte, 0, len(tagData)+len(timestampData)+len(valueData)+len(encodedTagDict))
+	res = append(res, encodedTagDict...)
+	res = append(res, timestampData...)
+	res = append(res, valueData...)
+	res = append(res, tagData...)
+
+	return res, nil
+}
+
+func DecodePointsFromBlock(data []byte) ([]Point, error) {
+	// TODO: Parse the point starting index.
+	reader := bytes.NewReader(data)
+
+	tagDict, err := decodeTagDictionary(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	b := &Block{
+		td: tagDict,
+	}
+
+	return nil, nil
 }

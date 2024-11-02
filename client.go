@@ -3,9 +3,11 @@ package serie
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 )
 
@@ -81,4 +83,55 @@ func (c *Client) writeToNode(addr string, data *bytes.Buffer) error {
 	}
 
 	return nil
+}
+
+func (c *Client) Query(query string) ([]QueryResult, error) {
+	// read from the nodes one by one such that the first nodes is checked first
+	// and after that try for each node sequentially to ensure that we're reading
+	// from the main node.
+
+	parsedQuery, err := parseQuery(query)
+	if err != nil {
+		return nil, err
+	}
+
+	nodes, err := c.distributor.ChooseNodes(parsedQuery.metric)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, node := range nodes {
+		urlValues := url.Values{}
+		urlValues.Add("query", query)
+		url := fmt.Sprintf("http://%s/query", node.String())
+
+		fullUrl := fmt.Sprintf("%s?%s", url, urlValues.Encode())
+
+		// if we error here we have some other problems so just quit
+		req, err := http.NewRequest(http.MethodGet, fullUrl, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			// try to get nodes from other node in list.
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			continue
+		}
+
+		var queryResult []QueryResult
+		if err := json.NewDecoder(resp.Body).Decode(&queryResult); err != nil {
+			continue
+		}
+
+		return queryResult, nil
+	}
+
+	return nil, errors.New("cannot connect to any nodes")
 }

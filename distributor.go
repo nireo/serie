@@ -3,6 +3,7 @@ package serie
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/rpc"
 	"os"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash"
+	"github.com/rs/zerolog"
 )
 
 type hasher struct{}
@@ -40,6 +42,7 @@ type Distributor struct {
 	ReplicationCount int
 	heartbeats       map[string]time.Time // address -> time when nodes responded to heartbeat.
 	mu               sync.RWMutex
+	log              zerolog.Logger
 }
 
 func NewDistributor(partitionCount, replicationFactor int) *Distributor {
@@ -52,7 +55,8 @@ func NewDistributor(partitionCount, replicationFactor int) *Distributor {
 
 	return &Distributor{
 		HashRing:         consistent.New(nil, conf),
-		ReplicationCount: 2,
+		ReplicationCount: replicationFactor,
+		log:              zerolog.New(os.Stderr).With().Timestamp().Str("component", "distributor").Logger(),
 	}
 }
 
@@ -76,6 +80,7 @@ func (d *Distributor) InitializeHeartbeat(heartbeatTimeout time.Duration) *Heart
 		clients:     make(map[string]*rpc.Client),
 	}
 
+	d.log.Info().Msg("starting up heartbeats")
 	manager.wg.Add(1)
 	go manager.heartbeatLoop()
 
@@ -99,6 +104,8 @@ func (h *HeartbeatManager) heartbeatLoop() {
 }
 
 func (h *HeartbeatManager) checkAndSendHeartbeats() {
+	h.distributor.log.Info().Msg("checking and sending heartbeats")
+
 	h.distributor.mu.Lock()
 	if len(h.distributor.Members) == 0 {
 		h.distributor.mu.Unlock()
@@ -112,27 +119,31 @@ func (h *HeartbeatManager) checkAndSendHeartbeats() {
 
 	var thisAddr string
 	if len(members) > 0 {
-		thisAddr = members[0].Addr
+		// Find this node's address
+		for _, m := range members {
+			if h.isLocal(m.Addr) {
+				thisAddr = m.Addr
+				// Mark this node as healthy immediately
+				h.distributor.heartbeats[thisAddr] = now
+				break
+			}
+		}
 	}
 
+	// Check for dead nodes
 	for _, member := range members {
+		if member.Addr == thisAddr {
+			continue
+		}
 		lastHeartbeat, exists := h.distributor.heartbeats[member.Addr]
 		if !exists || now.Sub(lastHeartbeat) > h.distributor.HeartbeatTimeout {
 			deadNodes = append(deadNodes, member)
 		}
 	}
 
-	for _, deadNode := range deadNodes {
-		h.distributor.removeNode(deadNode)
-		h.mu.Lock()
-		if client, exists := h.clients[deadNode.Addr]; exists {
-			client.Close()
-			delete(h.clients, deadNode.Addr)
-		}
-		h.mu.Unlock()
-	}
 	h.distributor.mu.Unlock()
 
+	// Send heartbeats to all other nodes
 	if thisAddr != "" {
 		var wg sync.WaitGroup
 		for _, member := range members {
@@ -143,8 +154,15 @@ func (h *HeartbeatManager) checkAndSendHeartbeats() {
 			wg.Add(1)
 			go func(addr string) {
 				defer wg.Done()
-				if err := h.sendHeartbeat(addr, thisAddr); err != nil {
-					fmt.Printf("Failed to send heartbeat to %s: %v\n", addr, err)
+				for attempts := 0; attempts < 3; attempts++ { // Add retry logic
+					if err := h.sendHeartbeat(addr, thisAddr); err != nil {
+						if attempts < 2 {
+							time.Sleep(50 * time.Millisecond)
+							continue
+						}
+						h.distributor.log.Error().Str("addr", addr).Err(err).Int("attemps", attempts+1).Msg("failed to send heartbeat to after retrys")
+					}
+					break
 				}
 			}(member.Addr)
 		}
@@ -302,4 +320,29 @@ func (d *Distributor) GetHealthyNodes() []*Member {
 	}
 
 	return healthyNodes
+}
+
+func (h *HeartbeatManager) isLocal(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+
+	if host == "localhost" || host == "127.0.0.1" {
+		return true
+	}
+
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok {
+			if ipnet.IP.String() == host {
+				return true
+			}
+		}
+	}
+	return false
 }

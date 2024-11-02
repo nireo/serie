@@ -339,13 +339,9 @@ func DecodePointsFromBlock(data []byte) ([]Point, error) {
 	// TODO: Parse the point starting index.
 	reader := bytes.NewReader(data)
 
-	tagDict, err := decodeTagDictionary(reader)
+	_, err := decodeTagDictionary(reader)
 	if err != nil {
 		return nil, err
-	}
-
-	b := &Block{
-		td: tagDict,
 	}
 
 	return nil, nil

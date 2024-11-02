@@ -8,12 +8,23 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
+
+	"github.com/rs/zerolog"
 )
 
 // Here the client can be used as an interface to interact with the distributed nodes.
 type Client struct {
 	distributor *Distributor
+	log         zerolog.Logger
+}
+
+func NewClient(d *Distributor) *Client {
+	return &Client{
+		distributor: d,
+		log:         zerolog.New(os.Stderr).With().Timestamp().Str("component", "client").Logger(),
+	}
 }
 
 func (c *Client) Write(points []Point) error {
@@ -27,9 +38,10 @@ func (c *Client) Write(points []Point) error {
 		return err
 	}
 
-	// Encode the points once since the same data is sent to each server.
-	var buf bytes.Buffer
-	if err = json.NewEncoder(&buf).Encode(points); err != nil {
+	c.log.Info().Str("nodes", fmt.Sprintf("%+v", nodes))
+
+	data, err := json.Marshal(points)
+	if err != nil {
 		return err
 	}
 
@@ -40,7 +52,8 @@ func (c *Client) Write(points []Point) error {
 		wg.Add(1)
 		go func(addr string) {
 			defer wg.Done()
-			errChan <- c.writeToNode(addr, &buf)
+			buf := bytes.NewBuffer(data)
+			errChan <- c.writeToNode(addr, buf)
 		}(node.String())
 	}
 
@@ -99,6 +112,8 @@ func (c *Client) Query(query string) ([]QueryResult, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	c.log.Info().Str("nodes", fmt.Sprintf("%+v", nodes))
 
 	for _, node := range nodes {
 		urlValues := url.Values{}

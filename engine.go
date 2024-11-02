@@ -35,6 +35,7 @@ type Engine interface {
 	Write(key string, timestamp int64, val float64) error
 	Read(key string, minTime, maxTime int64) ([]Point, error)
 	WriteBatch(points []Point) error
+	Query(queryStr string) ([]QueryResult, error)
 }
 
 // Point represents a single point in a given dataset.

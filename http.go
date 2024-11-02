@@ -119,6 +119,25 @@ func (s *HttpService) read(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+func (s *HttpService) query(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "unrecognized method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	qr := r.URL.Query()
+	queryString := qr.Get("query")
+
+	queryRes, err := s.db.Query(queryString)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to query results: %s", err), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(queryRes)
+	w.WriteHeader(http.StatusOK)
+}
+
 func (s *HttpService) Close() error {
 	return s.ln.Close()
 }

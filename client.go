@@ -56,10 +56,6 @@ func (c *Client) Write(points []Point) error {
 	return nil
 }
 
-func (c *Client) Read() error {
-	return nil
-}
-
 // writeToNode writes the json encoded points to a http service.
 // TODO: maybe consider having some other encoding format since json is not space efficient
 // nor fast.

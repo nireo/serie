@@ -1,6 +1,7 @@
 package serie
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -104,69 +105,80 @@ func (h *HeartbeatManager) heartbeatLoop() {
 }
 
 func (h *HeartbeatManager) checkAndSendHeartbeats() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	h.distributor.log.Info().Msg("checking and sending heartbeats")
 
-	h.distributor.mu.Lock()
+	h.distributor.mu.RLock()
 	if len(h.distributor.Members) == 0 {
-		h.distributor.mu.Unlock()
+		h.distributor.mu.RUnlock()
 		return
 	}
 
-	now := time.Now()
-	deadNodes := make([]*Member, 0)
 	members := make([]*Member, len(h.distributor.Members))
 	copy(members, h.distributor.Members)
+	h.distributor.mu.RUnlock()
 
 	var thisAddr string
-	if len(members) > 0 {
-		// Find this node's address
-		for _, m := range members {
-			if h.isLocal(m.Addr) {
-				thisAddr = m.Addr
-				// Mark this node as healthy immediately
-				h.distributor.heartbeats[thisAddr] = now
-				break
-			}
+	for _, m := range members {
+		if h.isLocal(m.Addr) {
+			thisAddr = m.Addr
+			h.distributor.mu.Lock()
+			h.distributor.heartbeats[thisAddr] = time.Now()
+			h.distributor.mu.Unlock()
+			break
 		}
 	}
 
-	// Check for dead nodes
+	if thisAddr == "" {
+		h.distributor.log.Warn().Msg("could not determine local address")
+		return
+	}
+
+	type heartbeatResult struct {
+		addr string
+		err  error
+	}
+	results := make(chan heartbeatResult, len(members))
+
 	for _, member := range members {
 		if member.Addr == thisAddr {
 			continue
 		}
-		lastHeartbeat, exists := h.distributor.heartbeats[member.Addr]
-		if !exists || now.Sub(lastHeartbeat) > h.distributor.HeartbeatTimeout {
-			deadNodes = append(deadNodes, member)
-		}
+
+		go func(addr string) {
+			err := h.sendHeartbeatWithTimeout(ctx, addr, thisAddr)
+			select {
+			case results <- heartbeatResult{addr: addr, err: err}:
+			case <-ctx.Done():
+			}
+		}(member.Addr)
 	}
 
-	h.distributor.mu.Unlock()
+	// Wait for results with timeout
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
 
-	// Send heartbeats to all other nodes
-	if thisAddr != "" {
-		var wg sync.WaitGroup
-		for _, member := range members {
-			if member.Addr == thisAddr || h.isNodeDead(member, deadNodes) {
-				continue
+	expectedResponses := len(members) - 1 // excluding self
+	for i := 0; i < expectedResponses; i++ {
+		select {
+		case result := <-results:
+			if result.err != nil {
+				h.distributor.log.Error().
+					Str("addr", result.addr).
+					Err(result.err).
+					Msg("heartbeat failed")
 			}
-
-			wg.Add(1)
-			go func(addr string) {
-				defer wg.Done()
-				for attempts := 0; attempts < 3; attempts++ { // Add retry logic
-					if err := h.sendHeartbeat(addr, thisAddr); err != nil {
-						if attempts < 2 {
-							time.Sleep(50 * time.Millisecond)
-							continue
-						}
-						h.distributor.log.Error().Str("addr", addr).Err(err).Int("attemps", attempts+1).Msg("failed to send heartbeat to after retrys")
-					}
-					break
-				}
-			}(member.Addr)
+		case <-timer.C:
+			h.distributor.log.Warn().
+				Int("expected", expectedResponses).
+				Int("received", i).
+				Msg("heartbeat timeout waiting for responses")
+			return
+		case <-ctx.Done():
+			return
 		}
-		wg.Wait()
 	}
 }
 
@@ -289,6 +301,9 @@ type HeartbeatArgs struct {
 type HeartbeatReply struct{}
 
 func (d *Distributor) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	// This method only logs the from id as being alive.
 	d.heartbeats[args.From] = time.Now()
 	return nil
@@ -345,4 +360,76 @@ func (h *HeartbeatManager) isLocal(addr string) bool {
 		}
 	}
 	return false
+}
+
+func (h *HeartbeatManager) getClient(ctx context.Context, addr string) (*rpc.Client, error) {
+	h.mu.RLock()
+	client, exists := h.clients[addr]
+	h.mu.RUnlock()
+
+	if exists && client != nil {
+		return client, nil
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if client, exists = h.clients[addr]; exists && client != nil {
+		return client, nil
+	}
+
+	for attempts := 0; attempts < 3; attempts++ {
+		connectChan := make(chan *rpc.Client, 1)
+		go func() {
+			if client, err := rpc.Dial("tcp", addr); err == nil {
+				connectChan <- client
+			} else {
+				connectChan <- nil
+			}
+		}()
+
+		select {
+		case client = <-connectChan:
+			if client != nil {
+				h.clients[addr] = client
+				return client, nil
+			}
+		case <-time.After(500 * time.Millisecond):
+			continue
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, fmt.Errorf("failed to connect after 3 attempts")
+}
+
+func (h *HeartbeatManager) sendHeartbeatWithTimeout(ctx context.Context, targetAddr, fromAddr string) error {
+	client, err := h.getClient(ctx, targetAddr)
+	if err != nil {
+		return fmt.Errorf("failed to get client: %w", err)
+	}
+
+	args := &HeartbeatArgs{From: fromAddr}
+	reply := &HeartbeatReply{}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Call("Distributor.Heartbeat", args, reply)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			h.mu.Lock()
+			delete(h.clients, targetAddr)
+			h.mu.Unlock()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		h.mu.Lock()
+		delete(h.clients, targetAddr)
+		h.mu.Unlock()
+		return ctx.Err()
+	}
 }

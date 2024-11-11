@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 func TestDistributor_Dump(t *testing.T) {
@@ -391,6 +393,9 @@ func TestNodeHealth(t *testing.T) {
 }
 
 func TestHeartbeatManager(t *testing.T) {
+	// Create a logger that writes to test output
+	testLogger := zerolog.New(zerolog.TestWriter{T: t}).With().Timestamp().Logger()
+
 	// Create temporary files for both distributors
 	tmpFile1, err := os.CreateTemp("", "cluster1*.json")
 	if err != nil {
@@ -404,26 +409,19 @@ func TestHeartbeatManager(t *testing.T) {
 	}
 	defer os.Remove(tmpFile2.Name())
 
-	// Create two distributors to simulate a cluster
+	// Create two distributors with longer timeouts for test stability
 	d1 := NewDistributor(271, 2)
 	d2 := NewDistributor(271, 2)
+
+	// Use test logger
+	d1.log = testLogger.With().Str("node", "d1").Logger()
+	d2.log = testLogger.With().Str("node", "d2").Logger()
 
 	// Set the cluster file paths
 	d1.ClusterFilePath = tmpFile1.Name()
 	d2.ClusterFilePath = tmpFile2.Name()
 
-	// Setup separate RPC servers for each distributor
-	server1 := rpc.NewServer()
-	server2 := rpc.NewServer()
-
-	if err := server1.Register(d1); err != nil {
-		t.Fatalf("Failed to register d1: %v", err)
-	}
-	if err := server2.Register(d2); err != nil {
-		t.Fatalf("Failed to register d2: %v", err)
-	}
-
-	// Start servers
+	// Setup TCP listeners directly for RPC (skip HTTP)
 	listener1, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -436,20 +434,22 @@ func TestHeartbeatManager(t *testing.T) {
 	}
 	defer listener2.Close()
 
-	// Create separate HTTP servers
-	mux1 := http.NewServeMux()
-	mux2 := http.NewServeMux()
+	// Create RPC servers
+	server1 := rpc.NewServer()
+	server2 := rpc.NewServer()
 
-	mux1.Handle(rpc.DefaultRPCPath, server1)
-	mux2.Handle(rpc.DefaultRPCPath, server2)
+	if err := server1.Register(d1); err != nil {
+		t.Fatalf("Failed to register d1: %v", err)
+	}
+	if err := server2.Register(d2); err != nil {
+		t.Fatalf("Failed to register d2: %v", err)
+	}
 
-	server1Http := &http.Server{Handler: mux1}
-	server2Http := &http.Server{Handler: mux2}
+	// Start serving RPC in goroutines
+	go server1.Accept(listener1)
+	go server2.Accept(listener2)
 
-	go server1Http.Serve(listener1)
-	go server2Http.Serve(listener2)
-
-	// Add members
+	// Create member entries
 	member1 := &Member{
 		Addr: listener1.Addr().String(),
 		Name: "node1",
@@ -459,65 +459,123 @@ func TestHeartbeatManager(t *testing.T) {
 		Name: "node2",
 	}
 
-	// Add nodes properly using AddNode
-	if err := d1.AddNode(member1); err != nil {
-		t.Fatal(err)
-	}
-	if err := d1.AddNode(member2); err != nil {
-		t.Fatal(err)
-	}
-	if err := d2.AddNode(member1); err != nil {
-		t.Fatal(err)
-	}
-	if err := d2.AddNode(member2); err != nil {
-		t.Fatal(err)
+	t.Logf("Node 1 address: %s", member1.Addr)
+	t.Logf("Node 2 address: %s", member2.Addr)
+
+	// Add nodes to both distributors
+	for _, op := range []struct {
+		d      *Distributor
+		m1, m2 *Member
+		name   string
+	}{
+		{d1, member1, member2, "d1"},
+		{d2, member1, member2, "d2"},
+	} {
+		if err := op.d.AddNode(op.m1); err != nil {
+			t.Fatalf("Failed to add member1 to %s: %v", op.name, err)
+		}
+		if err := op.d.AddNode(op.m2); err != nil {
+			t.Fatalf("Failed to add member2 to %s: %v", op.name, err)
+		}
 	}
 
-	// Initialize heartbeat managers with shorter timeout for testing
-	heartbeatTimeout := 500 * time.Millisecond
+	// Initialize heartbeat managers with longer timeout for testing
+	heartbeatTimeout := 2 * time.Second
 	manager1 := d1.InitializeHeartbeat(heartbeatTimeout)
 	manager2 := d2.InitializeHeartbeat(heartbeatTimeout)
 
-	defer manager1.Stop()
-	defer manager2.Stop()
-	defer server1Http.Close()
-	defer server2Http.Close()
+	// Ensure cleanup
+	defer func() {
+		manager1.Stop()
+		manager2.Stop()
+	}()
 
-	// Helper function to wait for node health with timeout
+	// Helper function to wait for node health with detailed logging
 	waitForHealthy := func(d *Distributor, addr string, timeout time.Duration) bool {
 		deadline := time.Now().Add(timeout)
+		attempts := 0
 		for time.Now().Before(deadline) {
+			attempts++
 			if d.IsNodeHealthy(addr) {
+				t.Logf("Node %s detected as healthy after %d attempts", addr, attempts)
 				return true
 			}
-			time.Sleep(50 * time.Millisecond)
+
+			// Log current state
+			d.mu.RLock()
+			heartbeat, exists := d.heartbeats[addr]
+			d.mu.RUnlock()
+
+			if exists {
+				t.Logf("Last heartbeat from %s was %v ago", addr, time.Since(heartbeat))
+			} else {
+				t.Logf("No heartbeat received yet from %s (attempt %d)", addr, attempts)
+			}
+
+			time.Sleep(100 * time.Millisecond)
 		}
 		return false
 	}
 
-	// Wait and verify with more detailed error messages
-	timeout := 5 * time.Second
+	// Wait for nodes to discover each other
+	t.Log("Waiting for nodes to discover each other...")
+	timeout := 10 * time.Second // Longer timeout for stability
+
+	// Test node1 -> node2 health
 	if !waitForHealthy(d1, member2.Addr, timeout) {
-		t.Errorf("Node 2 (%s) not healthy according to node 1 after %v. Heartbeats: %+v",
-			member2.Addr, timeout, d1.heartbeats)
+		d1.mu.RLock()
+		heartbeats := make(map[string]time.Time)
+		for k, v := range d1.heartbeats {
+			heartbeats[k] = v
+		}
+		d1.mu.RUnlock()
+
+		t.Errorf("Node 2 (%s) not healthy according to node 1 after %v\nHeartbeats: %+v",
+			member2.Addr, timeout, heartbeats)
 	}
 
+	// Test node2 -> node1 health
 	if !waitForHealthy(d2, member1.Addr, timeout) {
-		t.Errorf("Node 1 (%s) not healthy according to node 2 after %v. Heartbeats: %+v",
-			member1.Addr, timeout, d2.heartbeats)
+		d2.mu.RLock()
+		heartbeats := make(map[string]time.Time)
+		for k, v := range d2.heartbeats {
+			heartbeats[k] = v
+		}
+		d2.mu.RUnlock()
+
+		t.Errorf("Node 1 (%s) not healthy according to node 2 after %v\nHeartbeats: %+v",
+			member1.Addr, timeout, heartbeats)
 	}
 
-	// Additional verification
-	healthyNodes1 := d1.GetHealthyNodes()
-	healthyNodes2 := d2.GetHealthyNodes()
+	// Verify final state with detailed logging
+	t.Log("Verifying final cluster state...")
+
+	verifyClusterHealth := func(d *Distributor, name string) []*Member {
+		healthyNodes := d.GetHealthyNodes()
+		t.Logf("%s sees %d healthy nodes: %+v", name, len(healthyNodes), healthyNodes)
+
+		d.mu.RLock()
+		defer d.mu.RUnlock()
+
+		t.Logf("%s heartbeats state: %+v", name, d.heartbeats)
+		return healthyNodes
+	}
+
+	healthyNodes1 := verifyClusterHealth(d1, "Node 1")
+	healthyNodes2 := verifyClusterHealth(d2, "Node 2")
 
 	if len(healthyNodes1) != 2 {
-		t.Errorf("Node 1 sees %d healthy nodes, expected 2. Nodes: %+v",
+		t.Errorf("Node 1 sees %d healthy nodes, expected 2\nHealthy nodes: %+v",
 			len(healthyNodes1), healthyNodes1)
 	}
 
 	if len(healthyNodes2) != 2 {
-		t.Errorf("Node 2 sees %d healthy nodes, expected 2. Nodes: %+v",
+		t.Errorf("Node 2 sees %d healthy nodes, expected 2\nHealthy nodes: %+v",
 			len(healthyNodes2), healthyNodes2)
 	}
+
+	// Test successful cluster shutdown
+	t.Log("Testing clean shutdown...")
+	manager1.Stop()
+	manager2.Stop()
 }

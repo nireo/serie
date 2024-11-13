@@ -136,12 +136,14 @@ func (c *Client) Query(query string) ([]QueryResult, error) {
 		}
 		defer resp.Body.Close()
 
+		fmt.Fprintf(os.Stderr, "got status %d\n", resp.StatusCode)
 		if resp.StatusCode != http.StatusOK {
 			continue
 		}
 
 		var queryResult []QueryResult
 		if err := json.NewDecoder(resp.Body).Decode(&queryResult); err != nil {
+			fmt.Fprintf(os.Stderr, "got error encoding %s\n", err)
 			continue
 		}
 

@@ -53,6 +53,8 @@ func (s *HttpService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.write(w, r)
 	case strings.HasPrefix(r.URL.Path, "/read"):
 		s.read(w, r)
+	case strings.HasPrefix(r.URL.Path, "/query"):
+		s.query(w, r)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}

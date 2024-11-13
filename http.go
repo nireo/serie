@@ -137,7 +137,6 @@ func (s *HttpService) query(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(queryRes)
-	w.WriteHeader(http.StatusOK)
 }
 
 func (s *HttpService) Close() error {

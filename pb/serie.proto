@@ -19,6 +19,7 @@ message QueryResult {
 message TimestampQuery {
   int64 max_timestamp = 1;
   int64 min_timestamp = 2;
+  string metric = 3;
 }
 
 service Serie {

@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package pb;
+option go_package = "github.com/nireo/serie/pb";
+
+message Point {
+  string metric = 1;
+  double value = 2;
+  int64 timestamp = 3;
+  map<string, string> tags = 4;
+}
+
+// Query results are mainly just for aggregate functions
+message QueryResult {
+  string aggregate = 1;
+  map<string, double> values = 2;
+}
+
+message TimestampQuery {
+  int64 max_timestamp = 1;
+  int64 min_timestamp = 2;
+}
+
+service Serie {
+  rpc Write(WriteRequest) returns (WriteResponse) {}
+  rpc Read(ReadRequest) returns (ReadResponse) {}
+  rpc ReadStream(ReadRequest) returns (stream ReadResponse) {}
+  rpc Query(QueryRequest) returns (QueryResponse) {}
+  rpc WriteStream(stream WriteRequest) returns (stream WriteResponse) {}
+}
+
+message WriteRequest { repeated Point points = 1; }
+
+message WriteResponse {}
+
+message ReadRequest { TimestampQuery ts_query = 1; }
+
+message ReadResponse { repeated Point points = 1; }
+
+message QueryRequest { string query = 1; }
+
+message QueryResponse { repeated QueryResult result = 1; }

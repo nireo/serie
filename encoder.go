@@ -346,3 +346,7 @@ func DecodePointsFromBlock(data []byte) ([]Point, error) {
 
 	return nil, nil
 }
+
+func EncodePoints(points []Point) ([]byte, error) {
+	return nil, nil
+}

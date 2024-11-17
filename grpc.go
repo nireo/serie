@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/nireo/serie/pb"
+	"google.golang.org/grpc"
 )
 
 type grpcConfig struct {
@@ -21,6 +22,17 @@ func newGrpcServer(config *grpcConfig) (srv *grpcServer, err error) {
 		&pb.UnimplementedSerieServer{},
 	}
 	return srv, nil
+}
+
+func NewGRPCServer(config *grpcConfig, grpcOpts ...grpc.ServerOption) (*grpc.Server, error) {
+	gsrv := grpc.NewServer()
+	srv, err := newGrpcServer(config)
+	if err != nil {
+		return nil, err
+	}
+
+	pb.RegisterSerieServer(gsrv, srv)
+	return gsrv, nil
 }
 
 func convertToNonPbPoints(pbPoints []*pb.Point) []Point {
@@ -106,4 +118,23 @@ func (s *grpcServer) ReadStream(req *pb.ReadRequest, stream pb.Serie_ReadStreamS
 			}
 		}
 	}
+}
+
+func (s *grpcServer) Query(ctx context.Context, req *pb.QueryRequest) (*pb.QueryResponse, error) {
+	res, err := s.engine.Query(req.Query)
+	if err != nil {
+		return nil, err
+	}
+
+	pbQueryRes := make([]*pb.QueryResult, 0, len(res))
+	for _, qr := range res {
+		pbQueryRes = append(pbQueryRes, &pb.QueryResult{
+			Aggregate: qr.Aggregate,
+			Values:    qr.Result,
+		})
+	}
+
+	return &pb.QueryResponse{
+		Result: pbQueryRes,
+	}, nil
 }

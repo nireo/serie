@@ -786,16 +786,16 @@ func (t *TSMTree) aggregate(funcName, metric string, minTime, maxTime int64) (ag
 		return aggregateResult{}, errors.New("no points to aggregate")
 	}
 
-	switch {
-	case funcName == "avg":
+	switch funcName {
+	case "avg":
 		return aggregateResult{floatVal: sumUpValues(points) / float64(len(points)), kind: aggFloat}, nil
-	case funcName == "sum":
+	case "sum":
 		return aggregateResult{floatVal: sumUpValues(points), kind: aggFloat}, nil
-	case funcName == "count":
+	case "count":
 		return aggregateResult{intValue: int64(len(points)), kind: aggInt}, nil
-	case funcName == "min":
+	case "min":
 		return aggregateResult{floatVal: points[0].Value, kind: aggFloat}, nil // already sorted so the smallest element is the first element
-	case funcName == "max":
+	case "max":
 		return aggregateResult{floatVal: points[len(points)-1].Value, kind: aggFloat}, nil // already sorted so the smallest element is the first element
 	}
 
@@ -1039,7 +1039,7 @@ func maxMultipleTags(points []Point, pointTags []string) (QueryResult, error) {
 	return QueryResult{Aggregate: "max", Result: maxs}, nil
 }
 
-func countMultipleTags(points []Point, pointTags []string) (QueryResult, error) {
+func countMultipleTags(_ []Point, pointTags []string) (QueryResult, error) {
 	counts := make(map[string]float64)
 	for _, tag := range pointTags {
 		counts[tag]++

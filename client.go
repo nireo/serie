@@ -2,28 +2,24 @@ package serie
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
-	"sync"
 
 	"github.com/rs/zerolog"
 )
 
 // Here the client can be used as an interface to interact with the distributed nodes.
 type Client struct {
-	distributor *Distributor
-	log         zerolog.Logger
+	//distributor *Distributor
+	log zerolog.Logger
 }
 
-func NewClient(d *Distributor) *Client {
+func NewClient() *Client {
 	return &Client{
-		distributor: d,
-		log:         zerolog.New(os.Stderr).With().Timestamp().Str("component", "client").Logger(),
+		log: zerolog.New(os.Stderr).With().Timestamp().Str("component", "client").Logger(),
 	}
 }
 
@@ -33,40 +29,40 @@ func (c *Client) Write(points []Point) error {
 	}
 
 	// Get servers that should be written to.
-	nodes, err := c.distributor.ChooseNodes(points[0].Metric)
-	if err != nil {
-		return err
-	}
-
-	c.log.Info().Str("nodes", fmt.Sprintf("%+v", nodes))
-
-	data, err := json.Marshal(points)
-	if err != nil {
-		return err
-	}
-
-	errChan := make(chan error)
-	var wg sync.WaitGroup
-
-	for _, node := range nodes {
-		wg.Add(1)
-		go func(addr string) {
-			defer wg.Done()
-			buf := bytes.NewBuffer(data)
-			errChan <- c.writeToNode(addr, buf)
-		}(node.String())
-	}
-
-	go func() {
-		wg.Wait()
-		close(errChan)
-	}()
-
-	for err := range errChan {
-		if err != nil {
-			return err
-		}
-	}
+	// nodes, err := c.distributor.ChooseNodes(points[0].Metric)
+	// if err != nil {
+	// 	return err
+	// }
+	//
+	// c.log.Info().Str("nodes", fmt.Sprintf("%+v", nodes))
+	//
+	// data, err := json.Marshal(points)
+	// if err != nil {
+	// 	return err
+	// }
+	//
+	// errChan := make(chan error)
+	// var wg sync.WaitGroup
+	//
+	// for _, node := range nodes {
+	// 	wg.Add(1)
+	// 	go func(addr string) {
+	// 		defer wg.Done()
+	// 		buf := bytes.NewBuffer(data)
+	// 		errChan <- c.writeToNode(addr, buf)
+	// 	}(node.String())
+	// }
+	//
+	// go func() {
+	// 	wg.Wait()
+	// 	close(errChan)
+	// }()
+	//
+	// for err := range errChan {
+	// 	if err != nil {
+	// 		return err
+	// 	}
+	// }
 
 	return nil
 }
@@ -103,52 +99,52 @@ func (c *Client) Query(query string) ([]QueryResult, error) {
 	// and after that try for each node sequentially to ensure that we're reading
 	// from the main node.
 
-	parsedQuery, err := parseQuery(query)
-	if err != nil {
-		return nil, err
-	}
-
-	nodes, err := c.distributor.ChooseNodes(parsedQuery.metric)
-	if err != nil {
-		return nil, err
-	}
-
-	c.log.Info().Str("nodes", fmt.Sprintf("%+v", nodes))
-
-	for _, node := range nodes {
-		urlValues := url.Values{}
-		urlValues.Add("query", query)
-		url := fmt.Sprintf("http://%s/query", node.String())
-
-		fullUrl := fmt.Sprintf("%s?%s", url, urlValues.Encode())
-
-		// if we error here we have some other problems so just quit
-		req, err := http.NewRequest(http.MethodGet, fullUrl, nil)
-		if err != nil {
-			return nil, err
-		}
-
-		client := &http.Client{}
-		resp, err := client.Do(req)
-		if err != nil {
-			// try to get nodes from other node in list.
-			continue
-		}
-		defer resp.Body.Close()
-
-		fmt.Fprintf(os.Stderr, "got status %d\n", resp.StatusCode)
-		if resp.StatusCode != http.StatusOK {
-			continue
-		}
-
-		var queryResult []QueryResult
-		if err := json.NewDecoder(resp.Body).Decode(&queryResult); err != nil {
-			fmt.Fprintf(os.Stderr, "got error encoding %s\n", err)
-			continue
-		}
-
-		return queryResult, nil
-	}
+	// parsedQuery, err := parseQuery(query)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	//
+	// nodes, err := c.distributor.ChooseNodes(parsedQuery.metric)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	//
+	// c.log.Info().Str("nodes", fmt.Sprintf("%+v", nodes))
+	//
+	// for _, node := range nodes {
+	// 	urlValues := url.Values{}
+	// 	urlValues.Add("query", query)
+	// 	url := fmt.Sprintf("http://%s/query", node.String())
+	//
+	// 	fullUrl := fmt.Sprintf("%s?%s", url, urlValues.Encode())
+	//
+	// 	// if we error here we have some other problems so just quit
+	// 	req, err := http.NewRequest(http.MethodGet, fullUrl, nil)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	//
+	// 	client := &http.Client{}
+	// 	resp, err := client.Do(req)
+	// 	if err != nil {
+	// 		// try to get nodes from other node in list.
+	// 		continue
+	// 	}
+	// 	defer resp.Body.Close()
+	//
+	// 	fmt.Fprintf(os.Stderr, "got status %d\n", resp.StatusCode)
+	// 	if resp.StatusCode != http.StatusOK {
+	// 		continue
+	// 	}
+	//
+	// 	var queryResult []QueryResult
+	// 	if err := json.NewDecoder(resp.Body).Decode(&queryResult); err != nil {
+	// 		fmt.Fprintf(os.Stderr, "got error encoding %s\n", err)
+	// 		continue
+	// 	}
+	//
+	// 	return queryResult, nil
+	// }
 
 	return nil, errors.New("cannot connect to any nodes")
 }

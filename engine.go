@@ -25,12 +25,11 @@ import (
 // towards in memory database and I don't want to do that.
 //
 // Basic overview of the engine:
-// - Newest entries are written into memory. Once a in-memory table exceeds the maximum size
-//   it gets stored as a immutable memtable from which it can still be queried from.
-// - A background flush process is executed which takes the immutable tables and writes them
-//   into TSM files, which are persistant files on the disk which include a index. That index can
-//   easily used to find if a TSM file's contents would fulfill a query.
-
+//   - Newest entries are written into memory. Once a in-memory table exceeds the maximum size
+//     it gets stored as a immutable memtable from which it can still be queried from.
+//   - A background flush process is executed which takes the immutable tables and writes them
+//     into TSM files, which are persistant files on the disk which include a index. That index can
+//     easily used to find if a TSM file's contents would fulfill a query.
 type Engine interface {
 	Write(key string, timestamp int64, val float64) error
 	Read(key string, minTime, maxTime int64) ([]Point, error)

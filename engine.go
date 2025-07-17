@@ -45,6 +45,20 @@ type Point struct {
 	Tags      map[string]string `json:"tags"`
 }
 
+func (p *Point) estimateSize() int {
+	size := 8 + 8 + 8 // timestamp + value + map overhead
+	for k, v := range p.Tags {
+		size += len(k) + len(v) + 16 // string overhead
+	}
+	return size
+}
+
+type MetricSeries struct {
+	timestamps []int64
+	values     []float64
+	tags       []map[string]string
+}
+
 // MetricMetadata can optionally be defined for a given dataset such that the engine
 // knows more about what kind of data we are working with.
 type MetricMetadata struct {
@@ -94,27 +108,10 @@ type IndexEntry struct {
 	Size    int64
 }
 
-type TimeRange struct {
-	Start int64
-	End   int64
-}
-
 type Config struct {
 	MaxMemSize    int
 	DataDir       string
 	FlushInterval time.Duration
-}
-
-type TagIndex struct {
-	mu    sync.RWMutex
-	index map[string]map[string]struct{}
-}
-
-type ReadTransaction struct {
-	snapshot  map[string][]Point // snapshot of the current writable table
-	immutable []*Memtable        // snapshot of the immutable memtables
-	files     []*TSMFile         // snapshot of the current files
-	readTime  time.Time
 }
 
 func DefaultConfig() Config {
@@ -167,7 +164,7 @@ func (t *TSMTree) Write(key string, timestamp int64, val float64) error {
 
 	p := Point{Timestamp: timestamp, Value: val}
 	t.mem.data[key] = append(t.mem.data[key], p)
-	t.mem.size += 16
+	t.mem.size += p.estimateSize()
 
 	if t.mem.size >= t.maxMemSize {
 		t.log.Info().Msg("writable memtable reached maximum capacity")
@@ -188,7 +185,7 @@ func (t *TSMTree) WriteBatch(points []Point) error {
 			Value:     p.Value,
 			Tags:      p.Tags,
 		})
-		t.mem.size += 16 + estimateTagSize(p.Tags)
+		t.mem.size += p.estimateSize()
 
 		if t.mem.size >= t.maxMemSize {
 			t.immutable = append(t.immutable, t.mem)
@@ -650,7 +647,6 @@ func (t *TSMFile) decodeIndex(data []byte) error {
 
 func (t *TSMFile) createIndexFile() error {
 	indexPath := t.path[0:len(t.path)-4] + ".idx"
-
 	indexFile, err := os.Create(indexPath)
 	if err != nil {
 		return err
@@ -708,7 +704,7 @@ func (t *TSMTree) parseDataDir() error {
 				return
 			}
 
-			if err := tsmFile.decodeIndex(fileData); err != nil {
+			if err = tsmFile.decodeIndex(fileData); err != nil {
 				errChan <- fmt.Errorf("error decoding index for file %s: %w", entryName, err)
 				return
 			}

@@ -397,7 +397,7 @@ func TestParseDataDir(t *testing.T) {
 		t.Fatalf("failed to write points: %v", err)
 	}
 
-	if err := tree.Flush(); err != nil {
+	if err = tree.Flush(); err != nil {
 		t.Fatalf("error flushing tree: %v", err)
 	}
 
@@ -407,7 +407,7 @@ func TestParseDataDir(t *testing.T) {
 		expectedIndexEntriesForPath[f.path] = f.index["parse-dir"]
 	}
 
-	if err := tree.Close(); err != nil {
+	if err = tree.Close(); err != nil {
 		t.Fatalf("failed to close tsm tree: %v", err)
 	}
 

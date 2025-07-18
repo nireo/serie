@@ -52,12 +52,6 @@ func (p *Point) estimateSize() int {
 	return size
 }
 
-type MetricSeries struct {
-	timestamps []int64
-	values     []float64
-	tags       []map[string]string
-}
-
 // MetricMetadata can optionally be defined for a given dataset such that the engine
 // knows more about what kind of data we are working with.
 type MetricMetadata struct {
@@ -65,9 +59,13 @@ type MetricMetadata struct {
 }
 
 type TSMTree struct {
-	log         zerolog.Logger
-	metrics     map[string]MetricMetadata
-	dataDir     string
+	log     zerolog.Logger
+	metrics map[string]MetricMetadata
+	dataDir string
+	// keeps every tag string and metric name in a reusable place.
+	// this makes sense in this context as mostly time series data is
+	// redundant
+	sp          *StringPool
 	mem         *Memtable
 	immutable   []*Memtable
 	files       []*TSMFile

@@ -32,14 +32,18 @@ func (sd *SeriesData) AddPoint(timestamp int64, value float64) {
 type TagMap map[uint32]uint32
 
 func (t TagMap) Hash() uint64 {
-	var hash uint64 = 14695981039346656037 // FNV offset basis
-	const prime uint64 = 1099511628211     // FNV prime
-
+	hash := uint64(1)
 	for k, v := range t {
-		hash ^= uint64(k)
-		hash *= prime
-		hash ^= uint64(v)
-		hash *= prime
+		pairHash := uint64(14695981039346656037)
+		pairHash ^= uint64(k)
+		pairHash *= 1099511628211
+		pairHash ^= uint64(v)
+		pairHash *= 1099511628211
+
+		if pairHash == 0 {
+			pairHash = 1
+		}
+		hash *= pairHash
 	}
 	return hash
 }

@@ -1,20 +1,15 @@
 package serie
 
 import (
-	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/golang/snappy"
 	"github.com/rs/zerolog"
 )
 
@@ -38,29 +33,17 @@ type Engine interface {
 
 // Point represents a single point in a given dataset.
 type Point struct {
-	Metric    string            `json:"metric"`
-	Value     float64           `json:"value"`
-	Timestamp int64             `json:"timestamp"`
-	Tags      map[string]string `json:"tags"`
+	Metric    string  `json:"metric"`
+	Value     float64 `json:"value"`
+	Timestamp int64   `json:"timestamp"`
 }
 
 func (p *Point) estimateSize() int {
-	size := 8 + 8 + 8 // timestamp + value + map overhead
-	for k, v := range p.Tags {
-		size += len(k) + len(v) + 16 // string overhead
-	}
-	return size
-}
-
-// MetricMetadata can optionally be defined for a given dataset such that the engine
-// knows more about what kind of data we are working with.
-type MetricMetadata struct {
-	Tags []string
+	return 8 + 8 + 8
 }
 
 type TSMTree struct {
 	log     zerolog.Logger
-	metrics map[string]MetricMetadata
 	dataDir string
 	// keeps every tag string and metric name in a reusable place.
 	// this makes sense in this context as mostly time series data is
@@ -127,6 +110,7 @@ func NewTSMTree(conf Config) (*TSMTree, error) {
 		flushTicker: time.NewTicker(conf.FlushInterval),
 		done:        make(chan struct{}),
 		mu:          sync.RWMutex{},
+		sp:          NewStringPool(),
 	}
 
 	err := os.MkdirAll(conf.DataDir, os.ModePerm)
@@ -199,77 +183,19 @@ func (t *TSMTree) WriteBatch(key string, timestamps []int64, vals []float64, ser
 	return nil
 }
 
-func (t *TSMTree) Read(key string, minTime, maxTime int64) ([]Point, error) {
+type ReadResult struct {
+	Values     []float64
+	Timestamps []int64
+}
+
+func (t *TSMTree) Read(key string, minTime, maxTime int64, tags map[string]string) (*ReadResult, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	var res []Point
-	res = append(res, t.readFromMem(key, minTime, maxTime)...)
+	mid, tm := t.getMetricIDAndTagMap(key, tags)
+	series := t.mem.getSeries(mid, tm)
 
-	// Read the points from disk in a parallel fashion.
-	var wg sync.WaitGroup
-	resultsChan := make(chan []Point, len(t.files))
-	errorChan := make(chan error, len(t.files))
-
-	for _, file := range t.files {
-		wg.Add(1)
-
-		go func(f *TSMFile) {
-			defer wg.Done()
-			points, err := f.read(key, minTime, maxTime)
-			if err != nil {
-				errorChan <- err
-				return
-			}
-			resultsChan <- points
-		}(file)
-	}
-
-	go func() {
-		wg.Wait()
-		close(resultsChan)
-		close(errorChan)
-	}()
-
-	for err := range errorChan {
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	for points := range resultsChan {
-		res = append(res, points...)
-	}
-
-	sort.Slice(res, func(i, j int) bool {
-		return res[i].Timestamp < res[j].Timestamp
-	})
-
-	return res, nil
-}
-
-func (t *TSMTree) readFromMem(key string, minTime, maxTime int64) []Point {
-	var res []Point
-
-	if points, ok := t.mem.data[key]; ok {
-		for _, p := range points {
-			if p.Timestamp >= minTime && p.Timestamp <= maxTime {
-				res = append(res, p)
-			}
-		}
-	}
-
-	for _, immutable := range t.immutable {
-		if points, ok := immutable.data[key]; ok {
-			for _, p := range points {
-				if p.Timestamp >= minTime && p.Timestamp <= maxTime {
-					res = append(res, p)
-				}
-			}
-		}
-	}
-
-	return res
+	return series.ReadPoints(minTime, maxTime), nil
 }
 
 func (t *TSMTree) Flush() error {
@@ -286,7 +212,7 @@ func (t *TSMTree) Flush() error {
 
 	for _, table := range t.immutable {
 		wg.Add(1)
-		go func(mt *Memtable) {
+		go func(mt *memtable) {
 			defer wg.Done()
 			if err := t.flushMemtable(mt); err != nil {
 				errorChan <- err
@@ -325,31 +251,31 @@ func (t *TSMTree) Close() error {
 	return nil
 }
 
-func (t *TSMTree) flushMemtable(table *Memtable) error {
-	t.log.Info().Msg("creating a tsm file from memtable")
-	file, err := t.createTSMFile()
-	if err != nil {
-		return err
-	}
-
-	for key, points := range table.data {
-		if err := file.write(key, points); err != nil {
-			return err
-		}
-	}
-	t.log.Info().Msg("wrote points into tsm file")
-
-	if err := file.createIndexFile(); err != nil {
-		return err
-	}
-	t.log.Info().Msg("created a tsm index file")
-
-	if err := file.file.Sync(); err != nil {
-		return err
-	}
-	t.log.Info().Msg("finalized tsm index file")
-
-	t.files = append(t.files, file)
+func (t *TSMTree) flushMemtable(table *memtable) error {
+	// t.log.Info().Msg("creating a tsm file from memtable")
+	// file, err := t.createTSMFile()
+	// if err != nil
+	// 	return err
+	// }
+	//
+	// for key, points := range table.data {
+	// 	if err := file.write(key, points); err != nil {
+	// 		return err
+	// 	}
+	// }
+	// t.log.Info().Msg("wrote points into tsm file")
+	//
+	// if err := file.createIndexFile(); err != nil {
+	// 	return err
+	// }
+	// t.log.Info().Msg("created a tsm index file")
+	//
+	// if err := file.file.Sync(); err != nil {
+	// 	return err
+	// }
+	// t.log.Info().Msg("finalized tsm index file")
+	//
+	// t.files = append(t.files, file)
 	return nil
 }
 
@@ -370,272 +296,275 @@ func (t *TSMTree) createTSMFile() (*TSMFile, error) {
 }
 
 func (f *TSMFile) write(key string, points []Point) error {
-	if len(points) == 0 {
-		return nil
-	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	sort.Slice(points, func(i, j int) bool {
-		return points[i].Timestamp < points[j].Timestamp
-	})
-
-	offset := f.writePos
-
-	// Prepare data for compression
-	var buf bytes.Buffer
-	if err := binary.Write(&buf, binary.LittleEndian, uint32(len(points))); err != nil {
-		return err
-	}
-
-	for _, p := range points {
-		// write basic stuff
-		if err := binary.Write(&buf, binary.LittleEndian, p.Timestamp); err != nil {
-			return err
-		}
-
-		if err := binary.Write(&buf, binary.LittleEndian, p.Value); err != nil {
-			return err
-		}
-
-		if err := binary.Write(&buf, binary.LittleEndian, uint8(len(p.Tags))); err != nil {
-			return err
-		}
-
-		for tag, val := range p.Tags {
-			if err := binary.Write(&buf, binary.LittleEndian, uint8(len(tag))); err != nil {
-				return err
-			}
-
-			if _, err := buf.WriteString(tag); err != nil {
-				return err
-			}
-
-			if err := binary.Write(&buf, binary.LittleEndian, uint8(len(val))); err != nil {
-				return err
-			}
-
-			if _, err := buf.WriteString(val); err != nil {
-				return err
-			}
-		}
-	}
-
-	// Compress and write data
-	compressedData := snappy.Encode(nil, buf.Bytes())
-
-	// Write the size of the compressed data first
-	if err := binary.Write(f.file, binary.LittleEndian, uint32(len(compressedData))); err != nil {
-		return err
-	}
-
-	f.writePos += 4
-
-	n, err := f.file.Write(compressedData)
-	if err != nil {
-		return err
-	}
-	f.writePos += int64(n)
-
-	blockSize := f.writePos - offset
-	f.index[key] = append(f.index[key], IndexEntry{
-		MinTime: points[0].Timestamp,
-		MaxTime: points[len(points)-1].Timestamp,
-		Offset:  offset,
-		Size:    blockSize,
-	})
-
+	// if len(points) == 0 {
+	// 	return nil
+	// }
+	//
+	// f.mu.Lock()
+	// defer f.mu.Unlock()
+	//
+	// sort.Slice(points, func(i, j int) bool {
+	// 	return points[i].Timestamp < points[j].Timestamp
+	// })
+	//
+	// offset := f.writePos
+	//
+	// // Prepare data for compression
+	// var buf bytes.Buffer
+	// if err := binary.Write(&buf, binary.LittleEndian, uint32(len(points))); err != nil {
+	// 	return err
+	// }
+	//
+	// for _, p := range points {
+	// 	// write basic stuff
+	// 	if err := binary.Write(&buf, binary.LittleEndian, p.Timestamp); err != nil {
+	// 		return err
+	// 	}
+	//
+	// 	if err := binary.Write(&buf, binary.LittleEndian, p.Value); err != nil {
+	// 		return err
+	// 	}
+	//
+	// 	if err := binary.Write(&buf, binary.LittleEndian, uint8(len(p.Tags))); err != nil {
+	// 		return err
+	// 	}
+	//
+	// 	for tag, val := range p.Tags {
+	// 		if err := binary.Write(&buf, binary.LittleEndian, uint8(len(tag))); err != nil {
+	// 			return err
+	// 		}
+	//
+	// 		if _, err := buf.WriteString(tag); err != nil {
+	// 			return err
+	// 		}
+	//
+	// 		if err := binary.Write(&buf, binary.LittleEndian, uint8(len(val))); err != nil {
+	// 			return err
+	// 		}
+	//
+	// 		if _, err := buf.WriteString(val); err != nil {
+	// 			return err
+	// 		}
+	// 	}
+	// }
+	//
+	// // Compress and write data
+	// compressedData := snappy.Encode(nil, buf.Bytes())
+	//
+	// // Write the size of the compressed data first
+	// if err := binary.Write(f.file, binary.LittleEndian, uint32(len(compressedData))); err != nil {
+	// 	return err
+	// }
+	//
+	// f.writePos += 4
+	//
+	// n, err := f.file.Write(compressedData)
+	// if err != nil {
+	// 	return err
+	// }
+	// f.writePos += int64(n)
+	//
+	// blockSize := f.writePos - offset
+	// f.index[key] = append(f.index[key], IndexEntry{
+	// 	MinTime: points[0].Timestamp,
+	// 	MaxTime: points[len(points)-1].Timestamp,
+	// 	Offset:  offset,
+	// 	Size:    blockSize,
+	// })
+	//
+	// return nil
 	return nil
 }
 
 func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
+	// f.mu.RLock()
+	// defer f.mu.RUnlock()
+	//
+	// entries, ok := f.index[key]
+	// if !ok {
+	// 	return nil, nil
+	// }
+	//
+	// var res []Point
+	// for _, entry := range entries {
+	// 	if entry.MinTime > maxTime || entry.MaxTime < minTime {
+	// 		continue
+	// 	}
+	//
+	// 	data := make([]byte, entry.Size)
+	// 	_, err := f.file.ReadAt(data, entry.Offset)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	//
+	// 	compressedSize := binary.LittleEndian.Uint32(data[:4])
+	// 	compressedData := data[4 : 4+compressedSize]
+	// 	decompressedData, err := snappy.Decode(nil, compressedData)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	buf := bytes.NewReader(decompressedData)
+	//
+	// 	var numPoints uint32
+	// 	if err := binary.Read(buf, binary.LittleEndian, &numPoints); err != nil {
+	// 		return nil, err
+	// 	}
+	//
+	// 	for i := uint32(0); i < numPoints; i++ {
+	// 		var timestamp int64
+	// 		var value float64
+	// 		var tagsLen uint8
+	//
+	// 		if err := binary.Read(buf, binary.LittleEndian, &timestamp); err != nil {
+	// 			return nil, err
+	// 		}
+	//
+	// 		if err := binary.Read(buf, binary.LittleEndian, &value); err != nil {
+	// 			return nil, err
+	// 		}
+	//
+	// 		if err := binary.Read(buf, binary.LittleEndian, &tagsLen); err != nil {
+	// 			return nil, err
+	// 		}
+	//
+	// 		tagMap := make(map[string]string, tagsLen)
+	// 		for tagIdx := uint8(0); tagIdx < tagsLen; tagIdx++ {
+	// 			var tagKeyLen, tagValLen uint8
+	// 			if err := binary.Read(buf, binary.LittleEndian, &tagKeyLen); err != nil {
+	// 				return nil, err
+	// 			}
+	//
+	// 			tagKey := make([]byte, tagKeyLen)
+	// 			if _, err := io.ReadFull(buf, tagKey); err != nil {
+	// 				return nil, err
+	// 			}
+	//
+	// 			if err := binary.Read(buf, binary.LittleEndian, &tagValLen); err != nil {
+	// 				return nil, err
+	// 			}
+	//
+	// 			tagVal := make([]byte, tagValLen)
+	// 			if _, err := io.ReadFull(buf, tagVal); err != nil {
+	// 				return nil, err
+	// 			}
+	// 			tagMap[string(tagKey)] = string(tagVal)
+	// 		}
+	//
+	// 		if timestamp >= minTime && timestamp <= maxTime {
+	// 			res = append(res, Point{Timestamp: timestamp, Value: value, Tags: tagMap})
+	// 		}
+	// 	}
+	// }
+	//
+	// sort.Slice(res, func(i, j int) bool {
+	// 	return res[i].Timestamp < res[j].Timestamp
+	// })
 
-	entries, ok := f.index[key]
-	if !ok {
-		return nil, nil
-	}
-
-	var res []Point
-	for _, entry := range entries {
-		if entry.MinTime > maxTime || entry.MaxTime < minTime {
-			continue
-		}
-
-		data := make([]byte, entry.Size)
-		_, err := f.file.ReadAt(data, entry.Offset)
-		if err != nil {
-			return nil, err
-		}
-
-		compressedSize := binary.LittleEndian.Uint32(data[:4])
-		compressedData := data[4 : 4+compressedSize]
-		decompressedData, err := snappy.Decode(nil, compressedData)
-		if err != nil {
-			return nil, err
-		}
-		buf := bytes.NewReader(decompressedData)
-
-		var numPoints uint32
-		if err := binary.Read(buf, binary.LittleEndian, &numPoints); err != nil {
-			return nil, err
-		}
-
-		for i := uint32(0); i < numPoints; i++ {
-			var timestamp int64
-			var value float64
-			var tagsLen uint8
-
-			if err := binary.Read(buf, binary.LittleEndian, &timestamp); err != nil {
-				return nil, err
-			}
-
-			if err := binary.Read(buf, binary.LittleEndian, &value); err != nil {
-				return nil, err
-			}
-
-			if err := binary.Read(buf, binary.LittleEndian, &tagsLen); err != nil {
-				return nil, err
-			}
-
-			tagMap := make(map[string]string, tagsLen)
-			for tagIdx := uint8(0); tagIdx < tagsLen; tagIdx++ {
-				var tagKeyLen, tagValLen uint8
-				if err := binary.Read(buf, binary.LittleEndian, &tagKeyLen); err != nil {
-					return nil, err
-				}
-
-				tagKey := make([]byte, tagKeyLen)
-				if _, err := io.ReadFull(buf, tagKey); err != nil {
-					return nil, err
-				}
-
-				if err := binary.Read(buf, binary.LittleEndian, &tagValLen); err != nil {
-					return nil, err
-				}
-
-				tagVal := make([]byte, tagValLen)
-				if _, err := io.ReadFull(buf, tagVal); err != nil {
-					return nil, err
-				}
-				tagMap[string(tagKey)] = string(tagVal)
-			}
-
-			if timestamp >= minTime && timestamp <= maxTime {
-				res = append(res, Point{Timestamp: timestamp, Value: value, Tags: tagMap})
-			}
-		}
-	}
-
-	sort.Slice(res, func(i, j int) bool {
-		return res[i].Timestamp < res[j].Timestamp
-	})
-
-	return res, nil
+	return nil, nil
 }
 
 func (t *TSMFile) encodeIndex() ([]byte, error) {
-	var b bytes.Buffer
-	if err := binary.Write(&b, binary.LittleEndian, uint16(len(t.index))); err != nil {
-		return nil, err
-	}
-
-	for metric, entries := range t.index {
-		if err := binary.Write(&b, binary.LittleEndian, uint8(len(metric))); err != nil {
-			return nil, err
-		}
-
-		if _, err := b.WriteString(metric); err != nil {
-			return nil, err
-		}
-
-		if err := binary.Write(&b, binary.LittleEndian, uint16(len(entries))); err != nil {
-			return nil, err
-		}
-
-		for _, entry := range entries {
-			if err := binary.Write(&b, binary.LittleEndian, entry.MinTime); err != nil {
-				return nil, err
-			}
-
-			if err := binary.Write(&b, binary.LittleEndian, entry.MaxTime); err != nil {
-				return nil, err
-			}
-
-			if err := binary.Write(&b, binary.LittleEndian, entry.Offset); err != nil {
-				return nil, err
-			}
-
-			if err := binary.Write(&b, binary.LittleEndian, entry.Size); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	return snappy.Encode(nil, b.Bytes()), nil
+	// var b bytes.Buffer
+	// if err := binary.Write(&b, binary.LittleEndian, uint16(len(t.index))); err != nil {
+	// 	return nil, err
+	// }
+	//
+	// for metric, entries := range t.index {
+	// 	if err := binary.Write(&b, binary.LittleEndian, uint8(len(metric))); err != nil {
+	// 		return nil, err
+	// 	}
+	//
+	// 	if _, err := b.WriteString(metric); err != nil {
+	// 		return nil, err
+	// 	}
+	//
+	// 	if err := binary.Write(&b, binary.LittleEndian, uint16(len(entries))); err != nil {
+	// 		return nil, err
+	// 	}
+	//
+	// 	for _, entry := range entries {
+	// 		if err := binary.Write(&b, binary.LittleEndian, entry.MinTime); err != nil {
+	// 			return nil, err
+	// 		}
+	//
+	// 		if err := binary.Write(&b, binary.LittleEndian, entry.MaxTime); err != nil {
+	// 			return nil, err
+	// 		}
+	//
+	// 		if err := binary.Write(&b, binary.LittleEndian, entry.Offset); err != nil {
+	// 			return nil, err
+	// 		}
+	//
+	// 		if err := binary.Write(&b, binary.LittleEndian, entry.Size); err != nil {
+	// 			return nil, err
+	// 		}
+	// 	}
+	// }
+	//
+	// return snappy.Encode(nil, b.Bytes()), nil
+	return nil, nil
 }
 
 func (t *TSMFile) decodeIndex(data []byte) error {
-	decompressed, err := snappy.Decode(nil, data)
-	if err != nil {
-		return err
-	}
-
-	buf := bytes.NewReader(decompressed)
-
-	// read size so we can preallocate the index map
-	var indexSize uint16
-	if err := binary.Read(buf, binary.LittleEndian, &indexSize); err != nil {
-		return err
-	}
-
-	if t.index == nil {
-		t.index = make(map[string][]IndexEntry, indexSize)
-	}
-
-	for i := uint16(0); i < indexSize; i++ {
-		var metricLength uint8
-		if err := binary.Read(buf, binary.LittleEndian, &metricLength); err != nil {
-			return err
-		}
-
-		metric := make([]byte, metricLength)
-		if _, err := io.ReadFull(buf, metric); err != nil {
-			return err
-		}
-
-		var entriesSize uint16
-		if err := binary.Read(buf, binary.LittleEndian, &entriesSize); err != nil {
-			return err
-		}
-
-		indexes := make([]IndexEntry, 0, entriesSize)
-		for j := uint16(0); j < entriesSize; j++ {
-			indexEntry := IndexEntry{}
-			if err := binary.Read(buf, binary.LittleEndian, &indexEntry.MinTime); err != nil {
-				return err
-			}
-
-			if err := binary.Read(buf, binary.LittleEndian, &indexEntry.MaxTime); err != nil {
-				return err
-			}
-
-			if err := binary.Read(buf, binary.LittleEndian, &indexEntry.Offset); err != nil {
-				return err
-			}
-
-			if err := binary.Read(buf, binary.LittleEndian, &indexEntry.Size); err != nil {
-				return err
-			}
-
-			indexes = append(indexes, indexEntry)
-		}
-
-		t.index[string(metric)] = indexes
-	}
-
+	// decompressed, err := snappy.Decode(nil, data)
+	// if err != nil {
+	// 	return err
+	// }
+	//
+	// buf := bytes.NewReader(decompressed)
+	//
+	// // read size so we can preallocate the index map
+	// var indexSize uint16
+	// if err := binary.Read(buf, binary.LittleEndian, &indexSize); err != nil {
+	// 	return err
+	// }
+	//
+	// if t.index == nil {
+	// 	t.index = make(map[string][]IndexEntry, indexSize)
+	// }
+	//
+	// for i := uint16(0); i < indexSize; i++ {
+	// 	var metricLength uint8
+	// 	if err := binary.Read(buf, binary.LittleEndian, &metricLength); err != nil {
+	// 		return err
+	// 	}
+	//
+	// 	metric := make([]byte, metricLength)
+	// 	if _, err := io.ReadFull(buf, metric); err != nil {
+	// 		return err
+	// 	}
+	//
+	// 	var entriesSize uint16
+	// 	if err := binary.Read(buf, binary.LittleEndian, &entriesSize); err != nil {
+	// 		return err
+	// 	}
+	//
+	// 	indexes := make([]IndexEntry, 0, entriesSize)
+	// 	for j := uint16(0); j < entriesSize; j++ {
+	// 		indexEntry := IndexEntry{}
+	// 		if err := binary.Read(buf, binary.LittleEndian, &indexEntry.MinTime); err != nil {
+	// 			return err
+	// 		}
+	//
+	// 		if err := binary.Read(buf, binary.LittleEndian, &indexEntry.MaxTime); err != nil {
+	// 			return err
+	// 		}
+	//
+	// 		if err := binary.Read(buf, binary.LittleEndian, &indexEntry.Offset); err != nil {
+	// 			return err
+	// 		}
+	//
+	// 		if err := binary.Read(buf, binary.LittleEndian, &indexEntry.Size); err != nil {
+	// 			return err
+	// 		}
+	//
+	// 		indexes = append(indexes, indexEntry)
+	// 	}
+	//
+	// 	t.index[string(metric)] = indexes
+	// }
+	//
+	// return nil
 	return nil
 }
 
@@ -756,100 +685,39 @@ type aggregateResult struct {
 	kind     int
 }
 
-func sumUpValues(points []Point) float64 {
+func sumUpValues(points []float64) float64 {
 	pointSum := float64(0.0)
 	for _, p := range points {
-		pointSum += p.Value
+		pointSum += p
 	}
 
 	return pointSum
 }
 
-func (t *TSMTree) aggregate(funcName, metric string, minTime, maxTime int64) (aggregateResult, error) {
-	points, err := t.Read(metric, minTime, maxTime)
+func (t *TSMTree) aggregate(funcName, metric string, minTime, maxTime int64, tags map[string]string) (aggregateResult, error) {
+	res, err := t.Read(metric, minTime, maxTime, tags)
 	if err != nil {
 		return aggregateResult{}, err
 	}
 
-	if len(points) == 0 {
+	if len(res.Timestamps) == 0 {
 		return aggregateResult{}, errors.New("no points to aggregate")
 	}
 
 	switch funcName {
 	case "avg":
-		return aggregateResult{floatVal: sumUpValues(points) / float64(len(points)), kind: aggFloat}, nil
+		return aggregateResult{floatVal: sumUpValues(res.Values) / float64(len(res.Values)), kind: aggFloat}, nil
 	case "sum":
-		return aggregateResult{floatVal: sumUpValues(points), kind: aggFloat}, nil
+		return aggregateResult{floatVal: sumUpValues(res.Values), kind: aggFloat}, nil
 	case "count":
-		return aggregateResult{intValue: int64(len(points)), kind: aggInt}, nil
+		return aggregateResult{intValue: int64(len(res.Values)), kind: aggInt}, nil
 	case "min":
-		return aggregateResult{floatVal: points[0].Value, kind: aggFloat}, nil // already sorted so the smallest element is the first element
+		return aggregateResult{floatVal: res.Values[0], kind: aggFloat}, nil // already sorted so the smallest element is the first element
 	case "max":
-		return aggregateResult{floatVal: points[len(points)-1].Value, kind: aggFloat}, nil // already sorted so the smallest element is the first element
+		return aggregateResult{floatVal: res.Values[len(res.Values)-1], kind: aggFloat}, nil // already sorted so the smallest element is the first element
 	}
 
 	return aggregateResult{}, errors.New("unrecognized function")
-}
-
-func (t *TSMTree) groupBy(tagName, aggregateFunction string, metric string, minTime, maxTime int64) (map[string]float64, error) {
-	points, err := t.Read(metric, minTime, maxTime)
-	if err != nil {
-		return nil, err
-	}
-
-	groupedPoints := make(map[string][]float64)
-	for _, p := range points {
-		tagValue, ok := p.Tags[tagName]
-		if !ok {
-			tagValue = "<no_tag>"
-		}
-		groupedPoints[tagValue] = append(groupedPoints[tagValue], p.Value)
-	}
-
-	result := make(map[string]float64)
-
-	switch aggregateFunction {
-	case "sum":
-		for tagValue, values := range groupedPoints {
-			result[tagValue] = sum(values)
-		}
-	case "avg":
-		for tagValue, values := range groupedPoints {
-			result[tagValue] = average(values)
-		}
-	case "count":
-		for tagValue, values := range groupedPoints {
-			result[tagValue] = float64(len(values))
-		}
-	case "min":
-		for tagValue, values := range groupedPoints {
-			result[tagValue] = min(values)
-		}
-	case "max":
-		for tagValue, values := range groupedPoints {
-			result[tagValue] = max(values)
-		}
-	case "median":
-		for tagValue, values := range groupedPoints {
-			result[tagValue] = median(values)
-		}
-	case "percentile90":
-		for tagValue, values := range groupedPoints {
-			result[tagValue] = percentile(values, 90)
-		}
-	case "stddev":
-		for tagValue, values := range groupedPoints {
-			result[tagValue] = standardDeviation(values)
-		}
-	case "range":
-		for tagValue, values := range groupedPoints {
-			result[tagValue] = rangeValue(values)
-		}
-	default:
-		return nil, errors.New("unrecognized function")
-	}
-
-	return result, nil
 }
 
 type QueryResult struct {
@@ -890,72 +758,67 @@ func aggregateMultipleTags(aggregate string, points []Point, pointTags []string)
 }
 
 func (t *TSMTree) Query(queryStr string) ([]QueryResult, error) {
-	query, err := parseQuery(queryStr)
-	if err != nil {
-		return nil, err
-	}
+	// query, err := parseQuery(queryStr)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	//
+	// // It is expected that the resulting table has the same tags such that every point queried
+	// // has the same tags.
+	//
+	// groupBys := make(chan QueryResult)
+	//
+	// points, err := t.Read(query.metric, query.timeStart, query.timeEnd)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	//
+	// // pointsTags[i] is the wanted tags of point[i] in a string form such that they're easy to perform calculations on.
+	// var sb strings.Builder
+	// pointTags := make([]string, 0, len(points))
+	// for _, p := range points {
+	// 	for i, wantedTag := range query.groupBy {
+	// 		_, err := sb.WriteString(p.Tags[wantedTag])
+	// 		if err != nil {
+	// 			return nil, err
+	// 		}
+	//
+	// 		if i < len(query.groupBy)-1 {
+	// 			if err := sb.WriteByte(','); err != nil {
+	// 				return nil, err
+	// 			}
+	// 		}
+	// 	}
+	//
+	// 	pointTags = append(pointTags, sb.String())
+	// 	sb.Reset()
+	// }
+	//
+	// var wg sync.WaitGroup
+	// for _, aggregate := range query.aggregates {
+	// 	wg.Add(1)
+	// 	go func(aggregateFunc string) {
+	// 		defer wg.Done()
+	//
+	// 		queryRes, err := aggregateMultipleTags(aggregateFunc, points, pointTags)
+	// 		if err != nil {
+	// 			t.log.Err(err).Msg("failed to aggregate query")
+	// 			return
+	// 		}
+	//
+	// 		groupBys <- queryRes
+	// 	}(aggregate)
+	// }
+	//
+	// go func() {
+	// 	wg.Wait()
+	// 	close(groupBys)
+	// }()
+	//
+	// var res []QueryResult
+	// for m := range groupBys {
+	// 	res = append(res, m)
+	// }
 
-	// It is expected that the resulting table has the same tags such that every point queried
-	// has the same tags.
-
-	groupBys := make(chan QueryResult)
-
-	points, err := t.Read(query.metric, query.timeStart, query.timeEnd)
-	if err != nil {
-		return nil, err
-	}
-
-	// pointsTags[i] is the wanted tags of point[i] in a string form such that they're easy to perform calculations on.
-	var sb strings.Builder
-	pointTags := make([]string, 0, len(points))
-	for _, p := range points {
-		for i, wantedTag := range query.groupBy {
-			_, err := sb.WriteString(p.Tags[wantedTag])
-			if err != nil {
-				return nil, err
-			}
-
-			if i < len(query.groupBy)-1 {
-				if err := sb.WriteByte(','); err != nil {
-					return nil, err
-				}
-			}
-		}
-
-		pointTags = append(pointTags, sb.String())
-		sb.Reset()
-	}
-
-	var wg sync.WaitGroup
-	for _, aggregate := range query.aggregates {
-		wg.Add(1)
-		go func(aggregateFunc string) {
-			defer wg.Done()
-
-			queryRes, err := aggregateMultipleTags(aggregateFunc, points, pointTags)
-			if err != nil {
-				t.log.Err(err).Msg("failed to aggregate query")
-				return
-			}
-
-			groupBys <- queryRes
-		}(aggregate)
-	}
-
-	go func() {
-		wg.Wait()
-		close(groupBys)
-	}()
-
-	var res []QueryResult
-	for m := range groupBys {
-		res = append(res, m)
-	}
-
-	return res, nil
-}
-
-// AddMetricMetadata
-func (t *TSMTree) AddMetricMetadata(metric string, metadata MetricMetadata) {
-	t.metrics[metric] = metadata
+	return nil, nil
 }

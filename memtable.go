@@ -32,6 +32,20 @@ func (sd *SeriesData) AddPoint(timestamp int64, value float64) {
 	sd.mu.Unlock()
 }
 
+func (sd *SeriesData) ReadPoints(mintime, maxtime int64) *ReadResult {
+	sd.mu.RLock()
+	defer sd.mu.RUnlock()
+
+	res := &ReadResult{}
+	for i, ts := range sd.Timestamps {
+		if ts >= mintime && ts <= maxtime {
+			res.Timestamps = append(res.Timestamps, ts)
+			res.Values = append(res.Values, sd.Values[i])
+		}
+	}
+	return res
+}
+
 type TagMap map[uint32]uint32
 
 func (t TagMap) Hash() uint64 {
@@ -101,6 +115,18 @@ func (mem *memtable) getSeriesOrCreate(metric uint32, tagmap TagMap) *SeriesData
 	mem.size += 32 // TODO: fix this
 
 	return series
+}
+
+func (mem *memtable) getSeries(metric uint32, tagmap TagMap) *SeriesData {
+	key := newSeriesKey(metric, tagmap)
+	mem.mu.RLock()
+	if series, exists := mem.series[key]; exists {
+		mem.mu.RUnlock()
+		return series
+	}
+	mem.mu.RUnlock()
+
+	return nil
 }
 
 func (mem *memtable) AddPoint(metric uint32, timestamp int64, value float64, tags TagMap) {

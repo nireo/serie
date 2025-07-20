@@ -66,8 +66,8 @@ type TSMTree struct {
 	// this makes sense in this context as mostly time series data is
 	// redundant
 	sp          *StringPool
-	mem         *Memtable
-	immutable   []*Memtable
+	mem         *memtable
+	immutable   []*memtable
 	files       []*TSMFile
 	maxMemSize  int
 	mu          sync.RWMutex
@@ -122,7 +122,7 @@ func DefaultConfig() Config {
 func NewTSMTree(conf Config) (*TSMTree, error) {
 	t := &TSMTree{
 		dataDir:     conf.DataDir,
-		mem:         &Memtable{data: make(map[string][]Point)},
+		mem:         newMemtable(),
 		maxMemSize:  conf.MaxMemSize,
 		flushTicker: time.NewTicker(conf.FlushInterval),
 		done:        make(chan struct{}),
@@ -155,39 +155,45 @@ func (t *TSMTree) flushBackgroundJob() {
 	}
 }
 
-func (t *TSMTree) Write(key string, timestamp int64, val float64) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *TSMTree) convertTagsToTagMap(tags map[string]string) TagMap {
+	res := make(map[uint32]uint32, len(tags))
+	for k, v := range tags {
+		res[t.sp.Add(k)] = t.sp.Add(v)
+	}
 
-	p := Point{Timestamp: timestamp, Value: val}
-	t.mem.data[key] = append(t.mem.data[key], p)
-	t.mem.size += p.estimateSize()
+	return res
+}
+
+func (t *TSMTree) getMetricIDAndTagMap(metric string, tags map[string]string) (uint32, TagMap) {
+	metricID := t.sp.Add(metric)
+	tm := t.convertTagsToTagMap(tags)
+	return metricID, tm
+}
+
+func (t *TSMTree) Write(key string, timestamp int64, val float64, tags map[string]string) error {
+	mid, tm := t.getMetricIDAndTagMap(key, tags)
+	t.mem.AddPoint(mid, timestamp, val, tm)
 
 	if t.mem.size >= t.maxMemSize {
+		// TODO: some kind of lock here
 		t.log.Info().Msg("writable memtable reached maximum capacity")
 		t.immutable = append(t.immutable, t.mem)
-		t.mem = &Memtable{data: make(map[string][]Point)}
+		t.mem = newMemtable()
 	}
 
 	return nil
 }
 
-func (t *TSMTree) WriteBatch(points []Point) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *TSMTree) WriteBatch(key string, timestamps []int64, vals []float64, seriesTags map[string]string) error {
+	mid, tm := t.getMetricIDAndTagMap(key, seriesTags)
+	t.mem.BatchAddPoints(mid, timestamps, vals, tm)
 
-	for _, p := range points {
-		t.mem.data[p.Metric] = append(t.mem.data[p.Metric], Point{
-			Timestamp: p.Timestamp,
-			Value:     p.Value,
-			Tags:      p.Tags,
-		})
-		t.mem.size += p.estimateSize()
-
-		if t.mem.size >= t.maxMemSize {
-			t.immutable = append(t.immutable, t.mem)
-			t.mem = &Memtable{data: make(map[string][]Point)}
-		}
+	// TODO: implement some kind of checking for the points such that it doesnt go way past the limit for the memtable.
+	if t.mem.size >= t.maxMemSize {
+		// TODO: some kind of lock here
+		t.log.Info().Msg("writable memtable reached maximum capacity")
+		t.immutable = append(t.immutable, t.mem)
+		t.mem = newMemtable()
 	}
 
 	return nil

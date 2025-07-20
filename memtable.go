@@ -8,6 +8,7 @@ type SeriesData struct {
 	Tags       TagMap
 	Metric     uint32
 	capacity   int
+	mu         sync.RWMutex
 }
 
 func NewSeriesData(metric uint32, tags TagMap, initialCapacity int) *SeriesData {
@@ -25,8 +26,10 @@ func NewSeriesData(metric uint32, tags TagMap, initialCapacity int) *SeriesData 
 }
 
 func (sd *SeriesData) AddPoint(timestamp int64, value float64) {
+	sd.mu.Lock()
 	sd.Timestamps = append(sd.Timestamps, timestamp)
 	sd.Values = append(sd.Values, value)
+	sd.mu.Unlock()
 }
 
 type TagMap map[uint32]uint32
@@ -75,18 +78,46 @@ func newMemtable() *memtable {
 	}
 }
 
-func (mem *memtable) AddPoint(metric uint32, timestamp int64, value float64, tags TagMap) {
+func (mem *memtable) getSeriesOrCreate(metric uint32, tagmap TagMap) *SeriesData {
+	key := newSeriesKey(metric, tagmap)
+
+	mem.mu.RLock()
+	if series, exists := mem.series[key]; exists {
+		mem.mu.RUnlock()
+		return series
+	}
+	mem.mu.RUnlock()
+
 	mem.mu.Lock()
 	defer mem.mu.Unlock()
 
-	seriesKey := newSeriesKey(metric, tags)
-	series, exists := mem.series[seriesKey]
-	if !exists {
-		series = NewSeriesData(metric, tags, 0)
-		mem.series[seriesKey] = series
-		mem.metricToSeries[metric] = append(mem.metricToSeries[metric], seriesKey)
-		mem.size += 32 // TODO: fix this
+	if series, exists := mem.series[key]; exists {
+		return series
 	}
 
+	series := NewSeriesData(metric, tagmap, 0)
+	mem.series[key] = series
+	mem.metricToSeries[metric] = append(mem.metricToSeries[metric], key)
+	mem.size += 32 // TODO: fix this
+
+	return series
+}
+
+func (mem *memtable) AddPoint(metric uint32, timestamp int64, value float64, tags TagMap) {
+	series := mem.getSeriesOrCreate(metric, tags)
 	series.AddPoint(timestamp, value)
+}
+
+func (mem *memtable) BatchAddPoints(metric uint32, timestamps []int64, values []float64, tags TagMap) {
+	if len(timestamps) != len(values) {
+		panic("timestamps and values length mismatch")
+	}
+
+	series := mem.getSeriesOrCreate(metric, tags)
+
+	series.mu.Lock()
+	defer series.mu.Unlock()
+
+	series.Timestamps = append(series.Timestamps, timestamps...)
+	series.Values = append(series.Values, values...)
 }

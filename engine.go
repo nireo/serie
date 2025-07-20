@@ -1,15 +1,19 @@
 package serie
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/golang/snappy"
 	"github.com/rs/zerolog"
 )
 
@@ -74,7 +78,7 @@ type TSMFile struct {
 	mu       sync.RWMutex
 	path     string
 	file     *os.File
-	index    map[string][]IndexEntry
+	index    map[uint32][]IndexEntry
 	writePos int64
 }
 
@@ -86,6 +90,7 @@ type IndexEntry struct {
 	MaxTime int64
 	Offset  int64
 	Size    int64
+	TagHash int64
 }
 
 type Config struct {
@@ -252,31 +257,195 @@ func (t *TSMTree) Close() error {
 }
 
 func (t *TSMTree) flushMemtable(table *memtable) error {
-	// t.log.Info().Msg("creating a tsm file from memtable")
-	// file, err := t.createTSMFile()
-	// if err != nil
-	// 	return err
-	// }
-	//
-	// for key, points := range table.data {
-	// 	if err := file.write(key, points); err != nil {
-	// 		return err
-	// 	}
-	// }
-	// t.log.Info().Msg("wrote points into tsm file")
-	//
-	// if err := file.createIndexFile(); err != nil {
-	// 	return err
-	// }
-	// t.log.Info().Msg("created a tsm index file")
-	//
-	// if err := file.file.Sync(); err != nil {
-	// 	return err
-	// }
-	// t.log.Info().Msg("finalized tsm index file")
-	//
-	// t.files = append(t.files, file)
+	t.log.Info().Msg("creating a tsm file from memtable")
+	file, err := t.createTSMFile()
+	if err != nil {
+		return err
+	}
+
+	for _, series := range table.series {
+		if err := file.writeSeriesBlock(series); err != nil {
+			return err
+		}
+	}
+
+	t.log.Info().Msg("wrote points into tsm file")
+
+	if err := file.createIndexFile(); err != nil {
+		return err
+	}
+	t.log.Info().Msg("created a tsm index file")
+
+	if err := file.file.Sync(); err != nil {
+		return err
+	}
+	t.log.Info().Msg("finalized tsm index file")
+
+	t.files = append(t.files, file)
 	return nil
+}
+
+func (f *TSMFile) writeSeriesBlock(series *SeriesData) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if len(series.Timestamps) == 0 {
+		return nil
+	}
+
+	indices := make([]int, len(series.Timestamps))
+	for i := range indices {
+		indices[i] = i
+	}
+	sort.Slice(indices, func(i, j int) bool {
+		return series.Timestamps[indices[i]] < series.Timestamps[indices[j]]
+	})
+
+	sortedTimestamps := make([]int64, len(series.Timestamps))
+	sortedValues := make([]float64, len(series.Values))
+	for i, idx := range indices {
+		sortedTimestamps[i] = series.Timestamps[idx]
+		sortedValues[i] = series.Values[idx]
+	}
+
+	offset := f.writePos
+
+	var payload bytes.Buffer
+	deltaTimestamps := deltaEncode(sortedTimestamps)
+
+	for _, ts := range deltaTimestamps {
+		binary.Write(&payload, binary.LittleEndian, ts)
+	}
+
+	for _, val := range sortedValues {
+		binary.Write(&payload, binary.LittleEndian, val)
+	}
+
+	compressed := snappy.Encode(nil, payload.Bytes())
+
+	var header bytes.Buffer
+	blockSize := uint32(4 + 4 + 2 + 4 + 8 + 8 + 1 + len(series.Tags)*8 + 4 + len(compressed))
+	binary.Write(&header, binary.LittleEndian, blockSize)
+	binary.Write(&header, binary.LittleEndian, series.Metric)
+	binary.Write(&header, binary.LittleEndian, uint16(len(series.Tags)))
+	binary.Write(&header, binary.LittleEndian, uint32(len(series.Timestamps)))
+	binary.Write(&header, binary.LittleEndian, sortedTimestamps[0])
+	binary.Write(&header, binary.LittleEndian, sortedTimestamps[len(sortedTimestamps)-1])
+	binary.Write(&header, binary.LittleEndian, uint8(1))
+
+	for tagKey, tagVal := range series.Tags {
+		binary.Write(&header, binary.LittleEndian, tagKey)
+		binary.Write(&header, binary.LittleEndian, tagVal)
+	}
+
+	binary.Write(&header, binary.LittleEndian, uint32(len(compressed)))
+
+	if _, err := f.file.Write(header.Bytes()); err != nil {
+		return err
+	}
+	if _, err := f.file.Write(compressed); err != nil {
+		return err
+	}
+
+	f.writePos += int64(blockSize)
+
+	tagHash := series.Tags.Hash()
+	f.index[series.Metric] = append(f.index[series.Metric], IndexEntry{
+		TagHash: int64(tagHash),
+		MinTime: sortedTimestamps[0],
+		MaxTime: sortedTimestamps[len(sortedTimestamps)-1],
+		Offset:  offset,
+		Size:    int64(blockSize),
+	})
+
+	return nil
+}
+
+func (f *TSMFile) readSeriesBlock(metricID uint32, tagHash uint64, minTime, maxTime int64) (*ReadResult, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	entries, exists := f.index[metricID]
+	if !exists {
+		return &ReadResult{}, nil
+	}
+
+	for _, entry := range entries {
+		if entry.TagHash != int64(tagHash) {
+			continue
+		}
+		if entry.MinTime > maxTime || entry.MaxTime < minTime {
+			continue
+		}
+
+		headerSize := int64(4 + 4 + 2 + 4 + 8 + 8 + 1)
+		headerData := make([]byte, headerSize)
+		if _, err := f.file.ReadAt(headerData, entry.Offset); err != nil {
+			return nil, err
+		}
+
+		buf := bytes.NewReader(headerData)
+		var blockSize uint32
+		var metric uint32
+		var tagCount uint16
+		var pointCount uint32
+		var minTimestamp, maxTimestamp int64
+		var compressionType uint8
+
+		binary.Read(buf, binary.LittleEndian, &blockSize)
+		binary.Read(buf, binary.LittleEndian, &metric)
+		binary.Read(buf, binary.LittleEndian, &tagCount)
+		binary.Read(buf, binary.LittleEndian, &pointCount)
+		binary.Read(buf, binary.LittleEndian, &minTimestamp)
+		binary.Read(buf, binary.LittleEndian, &maxTimestamp)
+		binary.Read(buf, binary.LittleEndian, &compressionType)
+
+		tagPairsSize := int64(tagCount) * 8
+		dataOffset := entry.Offset + headerSize + tagPairsSize
+
+		var compressedSize uint32
+		compSizeData := make([]byte, 4)
+		if _, err := f.file.ReadAt(compSizeData, dataOffset); err != nil {
+			return nil, err
+		}
+		binary.Read(bytes.NewReader(compSizeData), binary.LittleEndian, &compressedSize)
+
+		compressedData := make([]byte, compressedSize)
+		if _, err := f.file.ReadAt(compressedData, dataOffset+4); err != nil {
+			return nil, err
+		}
+
+		decompressed, err := snappy.Decode(nil, compressedData)
+		if err != nil {
+			return nil, err
+		}
+
+		dataBuf := bytes.NewReader(decompressed)
+
+		deltaTimestamps := make([]int64, pointCount)
+		for i := uint32(0); i < pointCount; i++ {
+			binary.Read(dataBuf, binary.LittleEndian, &deltaTimestamps[i])
+		}
+
+		values := make([]float64, pointCount)
+		for i := uint32(0); i < pointCount; i++ {
+			binary.Read(dataBuf, binary.LittleEndian, &values[i])
+		}
+
+		timestamps := deltaDecode(deltaTimestamps)
+
+		result := &ReadResult{}
+		for i, ts := range timestamps {
+			if ts >= minTime && ts <= maxTime {
+				result.Timestamps = append(result.Timestamps, ts)
+				result.Values = append(result.Values, values[i])
+			}
+		}
+
+		return result, nil
+	}
+
+	return &ReadResult{}, nil
 }
 
 func (t *TSMTree) createTSMFile() (*TSMFile, error) {
@@ -289,7 +458,7 @@ func (t *TSMTree) createTSMFile() (*TSMFile, error) {
 
 	return &TSMFile{
 		path:     path,
-		index:    make(map[string][]IndexEntry),
+		index:    make(map[uint32][]IndexEntry),
 		writePos: 0,
 		file:     file,
 	}, nil
@@ -373,6 +542,42 @@ func (f *TSMFile) write(key string, points []Point) error {
 	// })
 	//
 	// return nil
+	return nil
+}
+
+func deltaEncode(timestamps []int64) []int64 {
+	if len(timestamps) == 0 {
+		return nil
+	}
+	deltas := make([]int64, len(timestamps))
+	deltas[0] = timestamps[0]
+	for i := 1; i < len(timestamps); i++ {
+		deltas[i] = timestamps[i] - timestamps[i-1]
+	}
+	return deltas
+}
+
+func deltaDecode(deltas []int64) []int64 {
+	if len(deltas) == 0 {
+		return nil
+	}
+
+	timestamps := make([]int64, len(deltas))
+	timestamps[0] = deltas[0]
+	for i := 1; i < len(deltas); i++ {
+		timestamps[i] = timestamps[i-1] + deltas[i]
+	}
+	return timestamps
+}
+
+func (f *TSMFile) writeSeriesBlock(series *SeriesData) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if len(series.Timestamps) == 0 {
+		return nil
+	}
+
 	return nil
 }
 

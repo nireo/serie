@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -42,7 +43,7 @@ func createTestTsmFile(t *testing.T) (*TSMFile, func()) {
 
 	tsmFile := &TSMFile{
 		file:     tmpfile,
-		index:    make(map[string][]IndexEntry),
+		index:    make(map[uint32][]IndexEntry),
 		writePos: 0,
 	}
 
@@ -93,6 +94,93 @@ func TestBasicWriteSingleEntry(t *testing.T) {
 
 		if tss[i] != res.Timestamps[i] {
 			t.Fatalf("timestamps were not equal, got=%d | want=%d", res.Timestamps[i], tss[i])
+		}
+	}
+}
+
+func TestTSMFile(t *testing.T) {
+	tm := TagMap{
+		12: 15,
+		1:  2,
+	}
+	sd := NewSeriesData(10, tm, 100)
+
+	ts := time.Now().Unix()
+	for i := int64(0); i < 100; i++ {
+		val := rand.Float64()
+		sd.Timestamps = append(sd.Timestamps, ts+i)
+		sd.Values = append(sd.Values, val)
+	}
+
+	file, cleanup := createTestTsmFile(t)
+	defer cleanup()
+
+	err := file.writeSeriesBlock(sd)
+	if err != nil {
+		t.Fatalf("error writing series block %s", err)
+	}
+
+	res, err := file.readSeriesBlock(10, tm.Hash(), sd.Timestamps[0], sd.Timestamps[len(sd.Timestamps)-1])
+	if err != nil {
+		t.Fatalf("error reading series block %s", err)
+	}
+
+	for i, ti := range res.Timestamps {
+		if !almostEqual(res.Values[i], sd.Values[i]) {
+			t.Fatalf("values were not equal, got=%f | want=%f", res.Values[i], sd.Values[i])
+		}
+
+		if ti != sd.Timestamps[i] {
+			t.Fatalf("timestamps were not equal, got=%d | want=%d", res.Timestamps[i], ti)
+		}
+	}
+}
+
+func TestIndexFile(t *testing.T) {
+	file, cleanup := createTestTsmFile(t)
+	defer cleanup()
+
+	expectedIndex := map[uint32][]IndexEntry{
+		1: {{
+			MinTime: 123,
+			MaxTime: 1234,
+			Offset:  190,
+			Size:    12,
+			TagHash: 12341234,
+		}},
+		2: {{
+			MinTime: 123,
+			MaxTime: 1234,
+			Offset:  19,
+			Size:    1,
+			TagHash: 12341234,
+		}},
+		3: {{
+			MinTime: 1,
+			MaxTime: 124,
+			Offset:  19,
+			Size:    12,
+			TagHash: 123414,
+		}},
+	}
+
+	file.index = expectedIndex
+
+	data, err := file.encodeIndex()
+	if err != nil {
+		t.Fatalf("failed to encode data %s", err)
+	}
+
+	file.index = nil
+	err = file.decodeIndex(data)
+	if err != nil {
+		t.Fatalf("failed to decode data %s", err)
+	}
+
+	for key, val := range expectedIndex {
+		got := file.index[key]
+		if !reflect.DeepEqual(got, val) {
+			t.Fatalf("values are not equal %+v %+v", got, val)
 		}
 	}
 }

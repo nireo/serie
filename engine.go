@@ -42,10 +42,6 @@ type Point struct {
 	Timestamp int64   `json:"timestamp"`
 }
 
-func (p *Point) estimateSize() int {
-	return 8 + 8 + 8
-}
-
 type TSMTree struct {
 	log     zerolog.Logger
 	dataDir string
@@ -270,12 +266,11 @@ func (t *TSMTree) flushMemtable(table *memtable) error {
 	}
 
 	t.log.Info().Msg("wrote points into tsm file")
-
 	if err := file.createIndexFile(); err != nil {
 		return err
 	}
-	t.log.Info().Msg("created a tsm index file")
 
+	t.log.Info().Msg("created a tsm index file")
 	if err := file.file.Sync(); err != nil {
 		return err
 	}
@@ -570,206 +565,104 @@ func deltaDecode(deltas []int64) []int64 {
 	return timestamps
 }
 
-func (f *TSMFile) writeSeriesBlock(series *SeriesData) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if len(series.Timestamps) == 0 {
-		return nil
+func (t *TSMFile) encodeIndex() ([]byte, error) {
+	var b bytes.Buffer
+	if err := binary.Write(&b, binary.LittleEndian, uint16(len(t.index))); err != nil {
+		return nil, err
 	}
 
-	return nil
-}
+	for metric, entries := range t.index {
+		if err := binary.Write(&b, binary.LittleEndian, metric); err != nil {
+			return nil, err
+		}
 
-func (f *TSMFile) read(key string, minTime, maxTime int64) ([]Point, error) {
-	// f.mu.RLock()
-	// defer f.mu.RUnlock()
-	//
-	// entries, ok := f.index[key]
-	// if !ok {
-	// 	return nil, nil
-	// }
-	//
-	// var res []Point
-	// for _, entry := range entries {
-	// 	if entry.MinTime > maxTime || entry.MaxTime < minTime {
-	// 		continue
-	// 	}
-	//
-	// 	data := make([]byte, entry.Size)
-	// 	_, err := f.file.ReadAt(data, entry.Offset)
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	//
-	// 	compressedSize := binary.LittleEndian.Uint32(data[:4])
-	// 	compressedData := data[4 : 4+compressedSize]
-	// 	decompressedData, err := snappy.Decode(nil, compressedData)
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	buf := bytes.NewReader(decompressedData)
-	//
-	// 	var numPoints uint32
-	// 	if err := binary.Read(buf, binary.LittleEndian, &numPoints); err != nil {
-	// 		return nil, err
-	// 	}
-	//
-	// 	for i := uint32(0); i < numPoints; i++ {
-	// 		var timestamp int64
-	// 		var value float64
-	// 		var tagsLen uint8
-	//
-	// 		if err := binary.Read(buf, binary.LittleEndian, &timestamp); err != nil {
-	// 			return nil, err
-	// 		}
-	//
-	// 		if err := binary.Read(buf, binary.LittleEndian, &value); err != nil {
-	// 			return nil, err
-	// 		}
-	//
-	// 		if err := binary.Read(buf, binary.LittleEndian, &tagsLen); err != nil {
-	// 			return nil, err
-	// 		}
-	//
-	// 		tagMap := make(map[string]string, tagsLen)
-	// 		for tagIdx := uint8(0); tagIdx < tagsLen; tagIdx++ {
-	// 			var tagKeyLen, tagValLen uint8
-	// 			if err := binary.Read(buf, binary.LittleEndian, &tagKeyLen); err != nil {
-	// 				return nil, err
-	// 			}
-	//
-	// 			tagKey := make([]byte, tagKeyLen)
-	// 			if _, err := io.ReadFull(buf, tagKey); err != nil {
-	// 				return nil, err
-	// 			}
-	//
-	// 			if err := binary.Read(buf, binary.LittleEndian, &tagValLen); err != nil {
-	// 				return nil, err
-	// 			}
-	//
-	// 			tagVal := make([]byte, tagValLen)
-	// 			if _, err := io.ReadFull(buf, tagVal); err != nil {
-	// 				return nil, err
-	// 			}
-	// 			tagMap[string(tagKey)] = string(tagVal)
-	// 		}
-	//
-	// 		if timestamp >= minTime && timestamp <= maxTime {
-	// 			res = append(res, Point{Timestamp: timestamp, Value: value, Tags: tagMap})
-	// 		}
-	// 	}
-	// }
-	//
-	// sort.Slice(res, func(i, j int) bool {
-	// 	return res[i].Timestamp < res[j].Timestamp
-	// })
+		if err := binary.Write(&b, binary.LittleEndian, uint16(len(entries))); err != nil {
+			return nil, err
+		}
 
-	return nil, nil
-}
+		for _, entry := range entries {
+			if err := binary.Write(&b, binary.LittleEndian, entry.MinTime); err != nil {
+				return nil, err
+			}
 
-func (t *TSMFile) encodeIndex() ([]byte, error) {
-	// var b bytes.Buffer
-	// if err := binary.Write(&b, binary.LittleEndian, uint16(len(t.index))); err != nil {
-	// 	return nil, err
-	// }
-	//
-	// for metric, entries := range t.index {
-	// 	if err := binary.Write(&b, binary.LittleEndian, uint8(len(metric))); err != nil {
-	// 		return nil, err
-	// 	}
-	//
-	// 	if _, err := b.WriteString(metric); err != nil {
-	// 		return nil, err
-	// 	}
-	//
-	// 	if err := binary.Write(&b, binary.LittleEndian, uint16(len(entries))); err != nil {
-	// 		return nil, err
-	// 	}
-	//
-	// 	for _, entry := range entries {
-	// 		if err := binary.Write(&b, binary.LittleEndian, entry.MinTime); err != nil {
-	// 			return nil, err
-	// 		}
-	//
-	// 		if err := binary.Write(&b, binary.LittleEndian, entry.MaxTime); err != nil {
-	// 			return nil, err
-	// 		}
-	//
-	// 		if err := binary.Write(&b, binary.LittleEndian, entry.Offset); err != nil {
-	// 			return nil, err
-	// 		}
-	//
-	// 		if err := binary.Write(&b, binary.LittleEndian, entry.Size); err != nil {
-	// 			return nil, err
-	// 		}
-	// 	}
-	// }
-	//
-	// return snappy.Encode(nil, b.Bytes()), nil
-	return nil, nil
+			if err := binary.Write(&b, binary.LittleEndian, entry.MaxTime); err != nil {
+				return nil, err
+			}
+
+			if err := binary.Write(&b, binary.LittleEndian, entry.Offset); err != nil {
+				return nil, err
+			}
+
+			if err := binary.Write(&b, binary.LittleEndian, entry.Size); err != nil {
+				return nil, err
+			}
+
+			if err := binary.Write(&b, binary.LittleEndian, entry.TagHash); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return snappy.Encode(nil, b.Bytes()), nil
 }
 
 func (t *TSMFile) decodeIndex(data []byte) error {
-	// decompressed, err := snappy.Decode(nil, data)
-	// if err != nil {
-	// 	return err
-	// }
-	//
-	// buf := bytes.NewReader(decompressed)
-	//
-	// // read size so we can preallocate the index map
-	// var indexSize uint16
-	// if err := binary.Read(buf, binary.LittleEndian, &indexSize); err != nil {
-	// 	return err
-	// }
-	//
-	// if t.index == nil {
-	// 	t.index = make(map[string][]IndexEntry, indexSize)
-	// }
-	//
-	// for i := uint16(0); i < indexSize; i++ {
-	// 	var metricLength uint8
-	// 	if err := binary.Read(buf, binary.LittleEndian, &metricLength); err != nil {
-	// 		return err
-	// 	}
-	//
-	// 	metric := make([]byte, metricLength)
-	// 	if _, err := io.ReadFull(buf, metric); err != nil {
-	// 		return err
-	// 	}
-	//
-	// 	var entriesSize uint16
-	// 	if err := binary.Read(buf, binary.LittleEndian, &entriesSize); err != nil {
-	// 		return err
-	// 	}
-	//
-	// 	indexes := make([]IndexEntry, 0, entriesSize)
-	// 	for j := uint16(0); j < entriesSize; j++ {
-	// 		indexEntry := IndexEntry{}
-	// 		if err := binary.Read(buf, binary.LittleEndian, &indexEntry.MinTime); err != nil {
-	// 			return err
-	// 		}
-	//
-	// 		if err := binary.Read(buf, binary.LittleEndian, &indexEntry.MaxTime); err != nil {
-	// 			return err
-	// 		}
-	//
-	// 		if err := binary.Read(buf, binary.LittleEndian, &indexEntry.Offset); err != nil {
-	// 			return err
-	// 		}
-	//
-	// 		if err := binary.Read(buf, binary.LittleEndian, &indexEntry.Size); err != nil {
-	// 			return err
-	// 		}
-	//
-	// 		indexes = append(indexes, indexEntry)
-	// 	}
-	//
-	// 	t.index[string(metric)] = indexes
-	// }
-	//
-	// return nil
+	decompressed, err := snappy.Decode(nil, data)
+	if err != nil {
+		return err
+	}
+
+	buf := bytes.NewReader(decompressed)
+
+	// read size so we can preallocate the index map
+	var indexSize uint16
+	if err := binary.Read(buf, binary.LittleEndian, &indexSize); err != nil {
+		return err
+	}
+
+	if t.index == nil {
+		t.index = make(map[uint32][]IndexEntry, indexSize)
+	}
+
+	for i := uint16(0); i < indexSize; i++ {
+		var metric uint32
+		if err := binary.Read(buf, binary.LittleEndian, &metric); err != nil {
+			return err
+		}
+
+		var entriesSize uint16
+		if err := binary.Read(buf, binary.LittleEndian, &entriesSize); err != nil {
+			return err
+		}
+
+		indexes := make([]IndexEntry, 0, entriesSize)
+		for j := uint16(0); j < entriesSize; j++ {
+			indexEntry := IndexEntry{}
+			if err := binary.Read(buf, binary.LittleEndian, &indexEntry.MinTime); err != nil {
+				return err
+			}
+
+			if err := binary.Read(buf, binary.LittleEndian, &indexEntry.MaxTime); err != nil {
+				return err
+			}
+
+			if err := binary.Read(buf, binary.LittleEndian, &indexEntry.Offset); err != nil {
+				return err
+			}
+
+			if err := binary.Read(buf, binary.LittleEndian, &indexEntry.Size); err != nil {
+				return err
+			}
+
+			if err := binary.Read(buf, binary.LittleEndian, &indexEntry.TagHash); err != nil {
+				return err
+			}
+
+			indexes = append(indexes, indexEntry)
+		}
+		t.index[metric] = indexes
+	}
+
 	return nil
 }
 

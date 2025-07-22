@@ -1,6 +1,8 @@
 package serie
 
-import "sync"
+import (
+	"sync"
+)
 
 type SeriesData struct {
 	Timestamps []int64
@@ -90,6 +92,17 @@ func newMemtable() *memtable {
 		metricToSeries: make(map[uint32][]seriesKey),
 		size:           0,
 	}
+}
+
+func (mem *memtable) getSeriesWithKey(key seriesKey) *SeriesData {
+	mem.mu.RLock()
+	if series, exists := mem.series[key]; exists {
+		mem.mu.RUnlock()
+		return series
+	}
+	mem.mu.RUnlock()
+
+	return nil
 }
 
 func (mem *memtable) getSeriesOrCreate(metric uint32, tagmap TagMap) *SeriesData {

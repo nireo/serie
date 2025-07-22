@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bits-and-blooms/bloom"
+	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/golang/snappy"
 	"github.com/rs/zerolog"
 )
@@ -63,11 +65,12 @@ type TSMTree struct {
 // When searching for given metrics and keys in a timeframe we can use the index
 // to look at them.
 type TSMFile struct {
-	mu       sync.RWMutex
-	path     string
-	file     *os.File
-	index    map[uint32][]IndexEntry
-	writePos int64
+	mu          sync.RWMutex
+	path        string
+	file        *os.File
+	index       map[uint32][]IndexEntry
+	writePos    int64
+	bloomFilter *bloom.BloomFilterf
 }
 
 // IndexEntry is used that we can efficiently find the points in a given TSM file.
@@ -81,15 +84,17 @@ type IndexEntry struct {
 	TagHash int64
 }
 
+// Config holds values for configurable parts of the engine.
 type Config struct {
 	MaxMemSize    int
 	DataDir       string
 	FlushInterval time.Duration
 }
 
+// DefaultConfig creates a configuration with sensible values
 func DefaultConfig() Config {
 	return Config{
-		MaxMemSize:    1024 * 1024 * 10, // 10 mb
+		MaxMemSize:    1024 * 1024 * 24, // 10 mb
 		DataDir:       "./serie",
 		FlushInterval: time.Minute * 10,
 	}
@@ -211,6 +216,33 @@ type ReadResult struct {
 	Timestamps []int64
 }
 
+func (r *ReadResult) sortByTimestamp() {
+	// not technically possible
+	if len(r.Timestamps) != len(r.Values) {
+		return
+	}
+
+	idxs := make([]int, len(r.Timestamps))
+	for i := range idxs {
+		idxs[i] = i
+	}
+
+	sort.Slice(idxs, func(i, j int) bool {
+		return r.Timestamps[idxs[i]] < r.Timestamps[idxs[j]]
+	})
+
+	sortedTimestamps := make([]int64, len(r.Timestamps))
+	sortedValues := make([]float64, len(r.Values))
+
+	for i, idx := range idxs {
+		sortedTimestamps[i] = r.Timestamps[idx]
+		sortedValues[i] = r.Values[idx]
+	}
+
+	r.Timestamps = sortedTimestamps
+	r.Values = sortedValues
+}
+
 func (t *TSMTree) Read(key string, minTime, maxTime int64, tags map[string]string) (*ReadResult, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -219,9 +251,64 @@ func (t *TSMTree) Read(key string, minTime, maxTime int64, tags map[string]strin
 	if err != nil {
 		return nil, fmt.Errorf("cannot convert tags and metric: %s", err)
 	}
-	series := t.mem.getSeries(mid, tm)
+	skey := newSeriesKey(mid, tm)
+	series := t.mem.getSeriesWithKey(skey)
+	rr := &ReadResult{}
+	if series != nil {
+		memrr := series.ReadPoints(minTime, maxTime)
+		rr = memrr
+	}
 
-	return series.ReadPoints(minTime, maxTime), nil
+	immrr := t.readImmutables(skey, minTime, maxTime)
+	if len(immrr.Timestamps) > 0 {
+		rr.Timestamps = append(rr.Timestamps, immrr.Timestamps...)
+		rr.Values = append(rr.Values, immrr.Values...)
+	}
+
+	fileres, err := t.readFiles(skey, minTime, maxTime)
+	if err != nil {
+		return nil, fmt.Errorf("error reading files: %s", err)
+	}
+
+	if len(fileres.Timestamps) > 0 {
+		rr.Timestamps = append(rr.Timestamps, fileres.Timestamps...)
+		rr.Values = append(rr.Values, fileres.Values...)
+	}
+
+	rr.sortByTimestamp()
+	return rr, nil
+}
+
+func (t *TSMTree) readImmutables(key seriesKey, mintime, maxtime int64) *ReadResult {
+	rr := &ReadResult{}
+
+	for _, im := range t.immutable {
+		data := im.getSeriesWithKey(key)
+		if data == nil {
+			continue
+		}
+
+		res := data.ReadPoints(mintime, maxtime)
+		rr.Timestamps = append(rr.Timestamps, res.Timestamps...)
+		rr.Values = append(rr.Values, res.Values...)
+	}
+
+	return rr
+}
+
+func (t *TSMTree) readFiles(key seriesKey, mintime, maxtime int64) (*ReadResult, error) {
+	rr := &ReadResult{}
+	for _, f := range t.files {
+		fileres, err := f.readSeriesBlock(key.metric, key.tagHash, mintime, maxtime)
+		if err != nil {
+			return nil, fmt.Errorf("error reading series block: %s", err)
+		}
+
+		rr.Timestamps = append(rr.Timestamps, fileres.Timestamps...)
+		rr.Values = append(rr.Values, fileres.Values...)
+	}
+
+	return rr, nil
 }
 
 func (t *TSMTree) Flush() error {

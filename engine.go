@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bits-and-blooms/bloom"
 	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/golang/snappy"
 	"github.com/rs/zerolog"
@@ -70,7 +69,7 @@ type TSMFile struct {
 	file        *os.File
 	index       map[uint32][]IndexEntry
 	writePos    int64
-	bloomFilter *bloom.BloomFilterf
+	bloomFilter *bloom.BloomFilter
 }
 
 // IndexEntry is used that we can efficiently find the points in a given TSM file.

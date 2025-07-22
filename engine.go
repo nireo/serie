@@ -48,7 +48,7 @@ type TSMTree struct {
 	// keeps every tag string and metric name in a reusable place.
 	// this makes sense in this context as mostly time series data is
 	// redundant
-	sp          *StringPool
+	sp          *PersistantStringPool
 	mem         *memtable
 	immutable   []*memtable
 	files       []*TSMFile
@@ -111,7 +111,6 @@ func NewTSMTree(conf Config) (*TSMTree, error) {
 		flushTicker: time.NewTicker(conf.FlushInterval),
 		done:        make(chan struct{}),
 		mu:          sync.RWMutex{},
-		sp:          NewStringPool(),
 	}
 
 	err := os.MkdirAll(conf.DataDir, os.ModePerm)
@@ -122,6 +121,10 @@ func NewTSMTree(conf Config) (*TSMTree, error) {
 	t.log = zerolog.New(os.Stderr).With().Timestamp().Str("component", "engine").Logger()
 	t.flushTicker = time.NewTicker(conf.FlushInterval)
 	go t.flushBackgroundJob()
+
+	if err = t.parseDataDir(); err != nil {
+		return nil, fmt.Errorf("cannot parse data dir: %s", err)
+	}
 
 	return t, nil
 }
@@ -140,23 +143,41 @@ func (t *TSMTree) flushBackgroundJob() {
 	}
 }
 
-func (t *TSMTree) convertTagsToTagMap(tags map[string]string) TagMap {
+func (t *TSMTree) convertTagsToTagMap(tags map[string]string) (TagMap, error) {
 	res := make(map[uint32]uint32, len(tags))
 	for k, v := range tags {
-		res[t.sp.Add(k)] = t.sp.Add(v)
+		key, err := t.sp.Add(k)
+		if err != nil {
+			return nil, err
+		}
+
+		val, err := t.sp.Add(v)
+		if err != nil {
+			return nil, err
+		}
+
+		res[key] = val
 	}
 
-	return res
+	return res, nil
 }
 
-func (t *TSMTree) getMetricIDAndTagMap(metric string, tags map[string]string) (uint32, TagMap) {
-	metricID := t.sp.Add(metric)
-	tm := t.convertTagsToTagMap(tags)
-	return metricID, tm
+func (t *TSMTree) getMetricIDAndTagMap(metric string, tags map[string]string) (uint32, TagMap, error) {
+	metricID, err := t.sp.Add(metric)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	tm, err := t.convertTagsToTagMap(tags)
+	return metricID, tm, err
 }
 
 func (t *TSMTree) Write(key string, timestamp int64, val float64, tags map[string]string) error {
-	mid, tm := t.getMetricIDAndTagMap(key, tags)
+	mid, tm, err := t.getMetricIDAndTagMap(key, tags)
+	if err != nil {
+		return fmt.Errorf("cannot convert tags and metric: %s", err)
+	}
+
 	t.mem.AddPoint(mid, timestamp, val, tm)
 
 	if t.mem.size >= t.maxMemSize {
@@ -170,7 +191,10 @@ func (t *TSMTree) Write(key string, timestamp int64, val float64, tags map[strin
 }
 
 func (t *TSMTree) WriteBatch(key string, timestamps []int64, vals []float64, seriesTags map[string]string) error {
-	mid, tm := t.getMetricIDAndTagMap(key, seriesTags)
+	mid, tm, err := t.getMetricIDAndTagMap(key, seriesTags)
+	if err != nil {
+		return fmt.Errorf("cannot convert tags and metric: %s", err)
+	}
 	t.mem.BatchAddPoints(mid, timestamps, vals, tm)
 
 	// TODO: implement some kind of checking for the points such that it doesnt go way past the limit for the memtable.
@@ -193,7 +217,10 @@ func (t *TSMTree) Read(key string, minTime, maxTime int64, tags map[string]strin
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	mid, tm := t.getMetricIDAndTagMap(key, tags)
+	mid, tm, err := t.getMetricIDAndTagMap(key, tags)
+	if err != nil {
+		return nil, fmt.Errorf("cannot convert tags and metric: %s", err)
+	}
 	series := t.mem.getSeries(mid, tm)
 
 	return series.ReadPoints(minTime, maxTime), nil
@@ -248,6 +275,8 @@ func (t *TSMTree) Close() error {
 			return err
 		}
 	}
+
+	t.sp.Close()
 
 	return nil
 }
@@ -687,6 +716,18 @@ func (t *TSMFile) createIndexFile() error {
 	return nil
 }
 
+// parsePool parses the string pool since all metrics and tag values are stored as numbers
+// due to redundancy in data, we need a file to store the string to id mappings
+func (t *TSMTree) parsePool(path string) error {
+	psp, err := LoadPersistantStringPool(path)
+	if err != nil {
+		return fmt.Errorf("failed to load string pool: %s", err)
+	}
+
+	t.sp = psp
+	return nil
+}
+
 // parseDataDir takes all of the index files in the data dir and then
 // builds in the TSM files from the directory and reads the indicies
 func (t *TSMTree) parseDataDir() error {
@@ -702,6 +743,16 @@ func (t *TSMTree) parseDataDir() error {
 
 	for _, entry := range entries {
 		if entry.IsDir() { // dirs shouldn't exist but just make sure
+			continue
+		}
+
+		// parse the pool file for the string to id mappings
+		if strings.Contains(entry.Name(), ".pool") {
+			err := t.parsePool(path.Join(t.dataDir, entry.Name()))
+			if err != nil {
+				return err
+			}
+
 			continue
 		}
 

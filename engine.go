@@ -59,14 +59,6 @@ type TSMTree struct {
 	done        chan struct{}
 }
 
-// Memtable is the in-memory table to query points fast that more fresh data is easily retrieved.
-// The memtables are then pushed into a list of immutable tables which will be flushed to disk.
-// The flush timing and the maximum mem size can be configured to fit the system and the workload.
-type Memtable struct {
-	data map[string][]Point
-	size int
-}
-
 // TSMFile is a read-only file on disk that contains an index and pointer to path.
 // When searching for given metrics and keys in a timeframe we can use the index
 // to look at them.
@@ -103,6 +95,7 @@ func DefaultConfig() Config {
 	}
 }
 
+// NewTSMTree creates a new TSMTree instance and it parses the data dir.
 func NewTSMTree(conf Config) (*TSMTree, error) {
 	t := &TSMTree{
 		dataDir:     conf.DataDir,
@@ -116,6 +109,11 @@ func NewTSMTree(conf Config) (*TSMTree, error) {
 	err := os.MkdirAll(conf.DataDir, os.ModePerm)
 	if err != nil {
 		return nil, err
+	}
+
+	t.sp, err = NewPersistantStringPool(path.Join(conf.DataDir, "string.pool"))
+	if err != nil {
+		return nil, fmt.Errorf("error creating the string pool: %s", err)
 	}
 
 	t.log = zerolog.New(os.Stderr).With().Timestamp().Str("component", "engine").Logger()
@@ -488,87 +486,6 @@ func (t *TSMTree) createTSMFile() (*TSMFile, error) {
 	}, nil
 }
 
-func (f *TSMFile) write(key string, points []Point) error {
-	// if len(points) == 0 {
-	// 	return nil
-	// }
-	//
-	// f.mu.Lock()
-	// defer f.mu.Unlock()
-	//
-	// sort.Slice(points, func(i, j int) bool {
-	// 	return points[i].Timestamp < points[j].Timestamp
-	// })
-	//
-	// offset := f.writePos
-	//
-	// // Prepare data for compression
-	// var buf bytes.Buffer
-	// if err := binary.Write(&buf, binary.LittleEndian, uint32(len(points))); err != nil {
-	// 	return err
-	// }
-	//
-	// for _, p := range points {
-	// 	// write basic stuff
-	// 	if err := binary.Write(&buf, binary.LittleEndian, p.Timestamp); err != nil {
-	// 		return err
-	// 	}
-	//
-	// 	if err := binary.Write(&buf, binary.LittleEndian, p.Value); err != nil {
-	// 		return err
-	// 	}
-	//
-	// 	if err := binary.Write(&buf, binary.LittleEndian, uint8(len(p.Tags))); err != nil {
-	// 		return err
-	// 	}
-	//
-	// 	for tag, val := range p.Tags {
-	// 		if err := binary.Write(&buf, binary.LittleEndian, uint8(len(tag))); err != nil {
-	// 			return err
-	// 		}
-	//
-	// 		if _, err := buf.WriteString(tag); err != nil {
-	// 			return err
-	// 		}
-	//
-	// 		if err := binary.Write(&buf, binary.LittleEndian, uint8(len(val))); err != nil {
-	// 			return err
-	// 		}
-	//
-	// 		if _, err := buf.WriteString(val); err != nil {
-	// 			return err
-	// 		}
-	// 	}
-	// }
-	//
-	// // Compress and write data
-	// compressedData := snappy.Encode(nil, buf.Bytes())
-	//
-	// // Write the size of the compressed data first
-	// if err := binary.Write(f.file, binary.LittleEndian, uint32(len(compressedData))); err != nil {
-	// 	return err
-	// }
-	//
-	// f.writePos += 4
-	//
-	// n, err := f.file.Write(compressedData)
-	// if err != nil {
-	// 	return err
-	// }
-	// f.writePos += int64(n)
-	//
-	// blockSize := f.writePos - offset
-	// f.index[key] = append(f.index[key], IndexEntry{
-	// 	MinTime: points[0].Timestamp,
-	// 	MaxTime: points[len(points)-1].Timestamp,
-	// 	Offset:  offset,
-	// 	Size:    blockSize,
-	// })
-	//
-	// return nil
-	return nil
-}
-
 func deltaEncode(timestamps []int64) []int64 {
 	if len(timestamps) == 0 {
 		return nil
@@ -904,70 +821,4 @@ func aggregateMultipleTags(aggregate string, points []Point, pointTags []string)
 	default:
 		return QueryResult{}, fmt.Errorf("unsupported aggregation function: %s", aggregate)
 	}
-}
-
-func (t *TSMTree) Query(queryStr string) ([]QueryResult, error) {
-	// query, err := parseQuery(queryStr)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	//
-	// // It is expected that the resulting table has the same tags such that every point queried
-	// // has the same tags.
-	//
-	// groupBys := make(chan QueryResult)
-	//
-	// points, err := t.Read(query.metric, query.timeStart, query.timeEnd)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	//
-	// // pointsTags[i] is the wanted tags of point[i] in a string form such that they're easy to perform calculations on.
-	// var sb strings.Builder
-	// pointTags := make([]string, 0, len(points))
-	// for _, p := range points {
-	// 	for i, wantedTag := range query.groupBy {
-	// 		_, err := sb.WriteString(p.Tags[wantedTag])
-	// 		if err != nil {
-	// 			return nil, err
-	// 		}
-	//
-	// 		if i < len(query.groupBy)-1 {
-	// 			if err := sb.WriteByte(','); err != nil {
-	// 				return nil, err
-	// 			}
-	// 		}
-	// 	}
-	//
-	// 	pointTags = append(pointTags, sb.String())
-	// 	sb.Reset()
-	// }
-	//
-	// var wg sync.WaitGroup
-	// for _, aggregate := range query.aggregates {
-	// 	wg.Add(1)
-	// 	go func(aggregateFunc string) {
-	// 		defer wg.Done()
-	//
-	// 		queryRes, err := aggregateMultipleTags(aggregateFunc, points, pointTags)
-	// 		if err != nil {
-	// 			t.log.Err(err).Msg("failed to aggregate query")
-	// 			return
-	// 		}
-	//
-	// 		groupBys <- queryRes
-	// 	}(aggregate)
-	// }
-	//
-	// go func() {
-	// 	wg.Wait()
-	// 	close(groupBys)
-	// }()
-	//
-	// var res []QueryResult
-	// for m := range groupBys {
-	// 	res = append(res, m)
-	// }
-
-	return nil, nil
 }

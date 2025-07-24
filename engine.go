@@ -29,10 +29,11 @@ import (
 //   - A background flush process is executed which takes the immutable tables and writes them
 //     into TSM files, which are persistant files on the disk which include a index. That index can
 //     easily used to find if a TSM file's contents would fulfill a query.
+
 type Engine interface {
-	Write(key string, timestamp int64, val float64) error
-	Read(key string, minTime, maxTime int64) ([]Point, error)
-	WriteBatch(points []Point) error
+	Write(metric string, timestamp int64, val float64, tags map[string]string) error
+	Read(metric string, minTime, maxTime int64, tags map[string]string) (*ReadResult, error)
+	WriteBatch(key string, timestamps []int64, vals []float64, seriesTags map[string]string) error
 	Query(queryStr string) ([]QueryResult, error)
 }
 
@@ -211,8 +212,8 @@ func (t *TSMTree) WriteBatch(key string, timestamps []int64, vals []float64, ser
 }
 
 type ReadResult struct {
-	Values     []float64
-	Timestamps []int64
+	Values     []float64 `json:"values"`
+	Timestamps []int64   `json:"timestamps"`
 }
 
 func (r *ReadResult) sortByTimestamp() {

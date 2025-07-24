@@ -373,25 +373,63 @@ func (t *TSMTree) flushMemtable(table *memtable) error {
 		return err
 	}
 
-	for _, series := range table.series {
-		if err := file.writeSeriesBlock(series); err != nil {
+	file.bloomFilter = bloom.NewWithEstimates(uint(len(table.series)), 0.01)
+	for sk, series := range table.series {
+		if err = file.writeSeriesBlock(series); err != nil {
 			return err
 		}
+
+		file.bloomFilter.Add(sk.toBytes())
 	}
 
 	t.log.Info().Msg("wrote points into tsm file")
-	if err := file.createIndexFile(); err != nil {
+	if err = file.createIndexFile(); err != nil {
 		return err
 	}
 
 	t.log.Info().Msg("created a tsm index file")
-	if err := file.file.Sync(); err != nil {
+	if err = file.file.Sync(); err != nil {
 		return err
 	}
 	t.log.Info().Msg("finalized tsm index file")
 
+	t.log.Info().Msg("creating tsm bloom filter file")
+	if err = file.writeBloomFilter(); err != nil {
+		return err
+	}
+	t.log.Info().Str("file", file.path).Msg("created the bloom filter file for file")
+
 	t.files = append(t.files, file)
 	return nil
+}
+
+func changeExtension(fp, ext string) string {
+	withoutExt := strings.TrimSuffix(fp, filepath.Ext(fp))
+
+	if ext == "" {
+		return withoutExt
+	}
+
+	if !strings.HasPrefix(ext, ".") {
+		ext = "." + ext
+	}
+
+	return withoutExt + ext
+}
+
+func (f *TSMFile) writeBloomFilter() error {
+	bloomPath := changeExtension(f.path, ".bloom")
+
+	file, err := os.Create(bloomPath)
+	if err != nil {
+		return fmt.Errorf("cannot create file for bloom filter %s", err)
+	}
+	// we can close the file since we don't need it during the runtime since
+	// nothing is added to the file.
+	defer file.Close()
+
+	_, err = f.bloomFilter.WriteTo(file)
+	return err
 }
 
 func (f *TSMFile) writeSeriesBlock(series *SeriesData) error {
@@ -598,13 +636,13 @@ func deltaDecode(deltas []int64) []int64 {
 	return timestamps
 }
 
-func (t *TSMFile) encodeIndex() ([]byte, error) {
+func (f *TSMFile) encodeIndex() ([]byte, error) {
 	var b bytes.Buffer
-	if err := binary.Write(&b, binary.LittleEndian, uint16(len(t.index))); err != nil {
+	if err := binary.Write(&b, binary.LittleEndian, uint16(len(f.index))); err != nil {
 		return nil, err
 	}
 
-	for metric, entries := range t.index {
+	for metric, entries := range f.index {
 		if err := binary.Write(&b, binary.LittleEndian, metric); err != nil {
 			return nil, err
 		}
@@ -639,7 +677,7 @@ func (t *TSMFile) encodeIndex() ([]byte, error) {
 	return snappy.Encode(nil, b.Bytes()), nil
 }
 
-func (t *TSMFile) decodeIndex(data []byte) error {
+func (f *TSMFile) decodeIndex(data []byte) error {
 	decompressed, err := snappy.Decode(nil, data)
 	if err != nil {
 		return err
@@ -653,8 +691,8 @@ func (t *TSMFile) decodeIndex(data []byte) error {
 		return err
 	}
 
-	if t.index == nil {
-		t.index = make(map[uint32][]IndexEntry, indexSize)
+	if f.index == nil {
+		f.index = make(map[uint32][]IndexEntry, indexSize)
 	}
 
 	for i := uint16(0); i < indexSize; i++ {
@@ -693,21 +731,21 @@ func (t *TSMFile) decodeIndex(data []byte) error {
 
 			indexes = append(indexes, indexEntry)
 		}
-		t.index[metric] = indexes
+		f.index[metric] = indexes
 	}
 
 	return nil
 }
 
-func (t *TSMFile) createIndexFile() error {
-	indexPath := t.path[0:len(t.path)-4] + ".idx"
+func (f *TSMFile) createIndexFile() error {
+	indexPath := changeExtension(f.path, ".idx")
 	indexFile, err := os.Create(indexPath)
 	if err != nil {
 		return err
 	}
 	defer indexFile.Close() // we don't need to keep the indexFile open since it won't be written to
 
-	encodedIndex, err := t.encodeIndex()
+	encodedIndex, err := f.encodeIndex()
 	if err != nil {
 		return err
 	}
@@ -770,7 +808,7 @@ func (t *TSMTree) parseDataDir() error {
 			defer wg.Done()
 			entryName := entry.Name()
 
-			tsmPath := path.Join(t.dataDir, entryName[:len(entryName)-4]+".tsm")
+			tsmPath := path.Join(t.dataDir, changeExtension(entryName, ".tsm"))
 			tsmFile := &TSMFile{
 				path: tsmPath,
 			}
@@ -789,6 +827,20 @@ func (t *TSMTree) parseDataDir() error {
 			file, err := os.Open(tsmFile.path)
 			if err != nil {
 				errChan <- fmt.Errorf("error decoding index for file %s: %w", entryName, err)
+				return
+			}
+
+			bloomFile, err := os.Open(changeExtension(tsmFile.path, ".bloom"))
+			if err != nil {
+				errChan <- fmt.Errorf("error opening bloom file %s", err)
+				return
+			}
+			defer bloomFile.Close()
+
+			var b bloom.BloomFilter
+			_, err = b.ReadFrom(bloomFile)
+			if err != nil {
+				errChan <- fmt.Errorf("error reading bloom file %s", err)
 				return
 			}
 

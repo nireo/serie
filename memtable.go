@@ -1,6 +1,7 @@
 package serie
 
 import (
+	"encoding/binary"
 	"sync"
 )
 
@@ -70,6 +71,16 @@ func (t TagMap) Hash() uint64 {
 type seriesKey struct {
 	metric  uint32
 	tagHash uint64
+}
+
+// toBytes encodes the data from a key to a unique byte key that can be used in
+// a bloom filter for example
+func (sk *seriesKey) toBytes() []byte {
+	data := make([]byte, 4+8)
+	binary.LittleEndian.PutUint32(data, sk.metric)
+	binary.LittleEndian.PutUint64(data[4:], sk.tagHash)
+
+	return data
 }
 
 func newSeriesKey(metric uint32, tags TagMap) seriesKey {

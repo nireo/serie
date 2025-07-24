@@ -8,6 +8,8 @@ import (
 	"sort"
 	"testing"
 	"time"
+
+	"github.com/bits-and-blooms/bloom/v3"
 )
 
 func createTestTreeInTmpDir(t *testing.T, maxMemSize int) (*TSMTree, func()) {
@@ -42,9 +44,10 @@ func createTestTsmFile(t *testing.T) (*TSMFile, func()) {
 	defer os.Remove(tmpfile.Name())
 
 	tsmFile := &TSMFile{
-		file:     tmpfile,
-		index:    make(map[uint32][]IndexEntry),
-		writePos: 0,
+		file:        tmpfile,
+		index:       make(map[uint32][]IndexEntry),
+		bloomFilter: bloom.NewWithEstimates(1000, 0.01),
+		writePos:    0,
 	}
 
 	return tsmFile, func() {

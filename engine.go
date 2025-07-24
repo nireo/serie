@@ -57,8 +57,12 @@ type TSMTree struct {
 	maxMemSize  int
 	mu          sync.RWMutex
 	flushTicker *time.Ticker
-	writeMu     sync.Mutex
 	done        chan struct{}
+
+	writeMu     sync.Mutex
+	immutableMu sync.RWMutex
+	filesMu     sync.RWMutex
+	flushMu     sync.Mutex
 }
 
 // TSMFile is a read-only file on disk that contains an index and pointer to path.
@@ -186,7 +190,11 @@ func (t *TSMTree) Write(key string, timestamp int64, val float64, tags map[strin
 	if t.mem.size >= t.maxMemSize {
 		// TODO: some kind of lock here
 		t.log.Info().Msg("writable memtable reached maximum capacity")
+
+		t.immutableMu.Lock()
 		t.immutable = append(t.immutable, t.mem)
+		t.immutableMu.Unlock()
+
 		t.mem = newMemtable()
 	}
 
@@ -204,7 +212,9 @@ func (t *TSMTree) WriteBatch(key string, timestamps []int64, vals []float64, ser
 	if t.mem.size >= t.maxMemSize {
 		// TODO: some kind of lock here
 		t.log.Info().Msg("writable memtable reached maximum capacity")
+		t.immutableMu.Lock()
 		t.immutable = append(t.immutable, t.mem)
+		t.immutableMu.Unlock()
 		t.mem = newMemtable()
 	}
 
@@ -282,7 +292,12 @@ func (t *TSMTree) Read(key string, minTime, maxTime int64, tags map[string]strin
 func (t *TSMTree) readImmutables(key seriesKey, mintime, maxtime int64) *ReadResult {
 	rr := &ReadResult{}
 
-	for _, im := range t.immutable {
+	t.immutableMu.RLock()
+	immutableSnapshot := make([]*memtable, len(t.immutable))
+	copy(immutableSnapshot, t.immutable)
+	t.immutableMu.RUnlock()
+
+	for _, im := range immutableSnapshot {
 		data := im.getSeriesWithKey(key)
 		if data == nil {
 			continue
@@ -298,7 +313,13 @@ func (t *TSMTree) readImmutables(key seriesKey, mintime, maxtime int64) *ReadRes
 
 func (t *TSMTree) readFiles(key seriesKey, mintime, maxtime int64) (*ReadResult, error) {
 	rr := &ReadResult{}
-	for _, f := range t.files {
+
+	t.filesMu.RLock()
+	filesSnapshot := make([]*TSMFile, len(t.files))
+	copy(filesSnapshot, t.files)
+	t.filesMu.RUnlock()
+
+	for _, f := range filesSnapshot {
 		fileres, err := f.readSeriesBlock(key.metric, key.tagHash, mintime, maxtime)
 		if err != nil {
 			return nil, fmt.Errorf("error reading series block: %s", err)
@@ -768,6 +789,9 @@ func (t *TSMTree) parsePool(path string) error {
 
 	t.sp = psp
 	return nil
+}
+
+func (t *TSMTree) merge() {
 }
 
 // parseDataDir takes all of the index files in the data dir and then
